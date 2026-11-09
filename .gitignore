@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+
+# Xcode local state and build products
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+*.xcarchive
+.build/
+.swiftpm/
+
+# Release / packaging artifacts
+*.ipa
+*.zip
+*.dSYM
+*.dSYM.zip
+
+# Local signing output
+*.mobileprovision
+*.p12
+*.cer
+
+# Local configuration / secrets
+*.xcconfig.local
+.env
+.env.*
+
+# Local build secrets (copy from Config/Secrets.example.xcconfig)
+Config/Secrets.xcconfig

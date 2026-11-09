@@ -1,0 +1,15 @@
+// Shared build settings for the iPodPlayer (Repod) target.
+// Do not put personal values here. Copy Config/Secrets.example.xcconfig to
+// Config/Secrets.xcconfig (git-ignored) and override them there.
+
+// Signing team. Empty = choose your team in Xcode, or build unsigned.
+DEVELOPMENT_TEAM =
+
+// Change this to an identifier you own before running on a device.
+PRODUCT_BUNDLE_IDENTIFIER = com.example.repod
+
+// Optional default Spotify Client ID (PKCE, no secret needed).
+// Empty = enter it in the app's Settings. A value entered in Settings always wins.
+SPOTIFY_CLIENT_ID =
+
+#include? "Secrets.xcconfig"
