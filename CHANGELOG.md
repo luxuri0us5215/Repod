@@ -2,11 +2,644 @@
 
 iPod 风格的 SwiftUI 音乐播放器：双层音源（网易云 / Spotify）、实体转盘交互、Cover Flow、锁屏与灵动岛。
 
-- 工程：`iPodPlayer/iPodPlayer.xcodeproj`（iOS 17.0+，Swift 5，Debug 模拟器构建 0 error 0 warning）
-- 打包快照：上一级目录的 `iPodPlayer-stageX.XX.zip`，与本文档章节一一对应
-- 2.0 起 `MARKETING_VERSION = 2.0.0`、`CURRENT_PROJECT_VERSION = 2`；1.x 的 `stage` 号只用于区分迭代快照，不参与构建
+- 工程：`iPodPlayer.xcodeproj`（iOS 17.0+，Swift 5，Debug 模拟器构建 0 error 0 warning）
+- 打包快照：开发时每版在本地存一份 `iPodPlayer-stageX.XX.zip`（不随仓库发布），与本文档章节一一对应
+- 版本号：`MARKETING_VERSION` 是发布版本号（本版 3.1.14），`CURRENT_PROJECT_VERSION` 是递增的 build 号（本版 23）；1.x 的 `stage` 号只用于区分迭代快照，不参与构建
 
 ---
+
+## 公开发布 3.1.14 — 2026-11-12
+
+公开仓库从 2.4.0 直接更新到 3.1.14（中间 2.5–3.1.14 的迭代此前只在本地开发分支上）。对使用者影响最大的几件事：
+
+- **3.0 起默认直连**：App 自己签名并直连 `music.163.com`，不再需要自己部署 NeteaseCloudMusicApi；原来的网关模式保留为可切换的选项
+- **3.1 外观重做**：五色机身（经典白 / 银色 / 午夜黑 / 薄荷 / 落日橙）× 浅色与深色屏，全玻璃转盘、页眉 Aqua 高光、机身漆面；新图标（深色 / 着色变体）与 Halo 启动画面
+- **3.1.7 Cover Flow 重写**，横屏封面墙与倒影
+- **网易云点赞修复**：3.1.13 给 weapi 请求补上客户端身份 Cookie，解决 -460 风控
+- **音源页选中条修复**：3.1.14 把选中条放进行的布局子树，修掉进场时向右跳一下
+- 新增 `iPodPlayerTests` 单元测试 target（签名、Cookie、连接模式等 24 项），CI 之外本地 `xcodebuild test` 即可跑
+
+安装方式与以前一致：从 Releases 取未签名 IPA 用 SideStore / AltStore 侧载，或按 README 从源码构建。
+
+---
+
+## 3.1.14 — 2026-11-12 进音源页时选中条向右跳一下
+
+回退：只改了一个文件。把 `Views/SourceSwitcherView.swift` 恢复成 3.1.13 的样子——删掉 rows 那层 VStack 上的 `.background(alignment: .topLeading) { … }` 整段、`.lcdSelectionBackground(false)` 改回 `.lcdSelectionBackground(highlighted)`、在 rows VStack 上找回 `.lcdLensHost()`、删掉 `@Environment(\.accessibilityReduceMotion) private var reduceMotion` 一行。`Views/GlassKit.swift` 和其它文件没改。
+
+**问题**：从 设置 → 音源 进音源页时，蓝色选中条先出现在行右边约 72pt，停一下再弹回行上，看起来像「指示器向右跳一下」。同一段里 设置 页是平滑滑入的。
+
+**原因**：选中条由 preference 上报的 rect 定位（`LCDLensHost` 用 `Anchor<CGRect>` + `backgroundPreferenceValue`）。音源页是 push 进场，整屏用 `ScreenEntryMotion` 的 `.offset` 从 +72pt 滑到 0；这条 rect 在滑入动画进行时被量了一次，把当时的入场位移算了进去，之后一直不重测，直到滑入结束（0.38s）才更正——于是条子停在「行 + 72pt」，再由 `glide` 弹簧补回行上。菜单 / 设置 / 搜索页的选中条在 ScrollView 里，入场动画期间每次布局都会重测，所以看不出来；音源页没有 ScrollView，也就没有重测。
+
+**修复**（`Views/SourceSwitcherView.swift`）
+- 音源页不再量 rect：两行本来等高（`Metrics.doubleLineRowHeight`），把选中条直接放进 rows VStack 的 `.background(alignment: .topLeading)`，按 `viewModel.selectedIndex` 用 `.offset(y:)` 摆到对应行。条子和行在同一个布局子树里，入场滑动时一起动，永远量不到「飞行中」的位移。
+- 行不再各自画条：`.lcdSelectionBackground(false)`；白字 / 对勾仍按 `highlighted` 走。
+- 手感不变：换行仍是 `LCDLensHost.glide` 弹簧（`.animation(…, value: selectedIndex)`），Reduce Motion 下不动画。
+
+**验证**：模拟器 std-17Pro（iOS 27.2，1206×2622，1pt = 3px），`simctl io recordVideo` 录 60fps 后逐帧量蓝色条的 bbox。
+- 修复前：音源页入场时条子停在 x=282（行左缘 66 + 216px，正好 72pt）约 0.21s，然后跳到 x=98，再从 134→120→108→…→66 慢慢归位，全程约 0.62s；同期 设置页 是平滑的 200→160→128→…→66。
+- 修复后：音源页与 设置页 完全一致，200→160→128→110→98→90→84→…→66，约 0.33s，条子与行同步滑入；稳态画面（条子位置、白色文字、右侧对勾、页脚「按中键配置」）与修复前一致。
+
+---
+
+## 3.1.13 — 2026-11-12 网易云点赞失败（-460 风控）
+
+回退：把上一级目录 `iPodPlayer-stage3.1.12-backup-pre-3.1.13/` 里的文件放回原处（`Services/NetEaseDirectRoute.swift`、`Services/NetEaseDirectTransport.swift`、`Tests/NetEaseDirectRouteTests.swift` → `iPodPlayerTests/`、`project.pbxproj`、`CHANGELOG.md`）。
+
+**问题**：中键长按点红心失败，弹出「网易云暂时限流，正在后台自动重试。」（也就是网易云的 -460）。收藏、取消收藏都失败，读接口（歌单、搜索）正常。
+
+**原因**：直连模式的 weapi 请求，Cookie 里只有登录会话那几项（`MUSIC_U` / `__csrf` / `NMTID`），没有客户端身份（os、appver、deviceId…）。网易云的风控把这种请求判为「检测到您的网络环境存在风险」，返回 -460，App 就把它当成限流。
+
+一直在维护的参考实现 NeteaseCloudMusicApiEnhanced 正是对**每个**请求都补这套身份 Cookie（`util/request.js` 的 `processCookieObject`）；2021 年它修红心接口的同一个 -460 时（commit `d1907ae5`，issue #1151），改的也是给红心请求补 `cookie.os` / `cookie.appver`。
+
+本机实测（同一个出口 IP、相隔一分钟、都是未登录状态，`POST /weapi/radio/like`）：
+
+| 请求里的 Cookie | 返回 |
+| --- | --- |
+| 带客户端身份（os=pc、appver、osver、deviceId、channel、`_ntes_nuid`、WNMCID…） | `{"code":301}` —— 通过了风控，只是没登录 |
+| 只有 NMTID（即 3.1.12 之前的行为） | `{"code":-460}` —— 风控拒绝 |
+| 只有 NMTID + Windows 客户端 UA | 仍然 `-460` |
+
+所以决定因素是身份 Cookie，跟 UA 无关。
+
+**修复**（`Services/NetEaseDirectRoute.swift`）
+- 新增 `identityCookie(existing:deviceId:)`：在已有 Cookie 后面补齐 `os=pc`、`appver=3.1.17.204416`、`osver`、`channel=netease`、`deviceId`、`_ntes_nuid`（32 位十六进制随机）、`_ntes_nnid`、`WNMCID`、`WEVNSM=1.0.0`、`__remember_me`、`ntes_kaola_ad`，与 Enhanced 的 `processCookieObject` 同一套字段。
+- **登录时下发过的值不覆盖**：扫码登录如果自己带了 `os` / `appver` / `deviceId`，就用服务端给的；缺哪项补哪项。`deviceId` 缺省时用扫码登录的同一个（`NetEaseDeviceID.current`），登录和后续接口自称同一台设备。
+- `weapiRequest` 改为始终发这份身份 Cookie（空 Cookie 时也发），`csrf_token` 仍从 Cookie 里的 `__csrf` 取。
+- 所有 weapi 接口（搜索、歌单、红心、喜欢列表、推荐、播客…）都走这一层，不只是红心。
+- 听歌打卡的 clientlog eapi 请求原本每次随机一个 deviceId，改为与登录同一个（`Services/NetEaseDirectTransport.swift`）。
+
+**测试**（`iPodPlayerTests/NetEaseDirectRouteTests.swift`）
+- 更新红心请求测试：Cookie 里必须带 `os=pc`、`appver`、`deviceId`、`channel`，同时保留 `MUSIC_U`。
+- 新增两项：缺字段时补齐且不产生重复 Cookie 名；登录已下发的身份（`appver=9.9.9`、`deviceId=DEADBEEF`、`_ntes_nuid`）不被覆盖，`_ntes_nnid` 跟随它。
+
+已用 `xcodebuild test` 在 std-17Pro 模拟器编译并跑过：24 个测试 0 失败（3 个需要网易云网络的真机探针照常跳过）。本机到 music.163.com 时通时断，真机点赞请自己点一次确认。
+
+---
+
+
+
+回退：把上一级目录 `iPodPlayer-stage3.1.11-backup-pre-3.1.12/` 里的文件放回原处（`Services/` 下 4 个、`Models/PlayerState.swift`、`Tests/NetEaseDirectRouteTests.swift` → `iPodPlayerTests/`）。
+
+**问题**：扫码后手机提示「请切换其他登录方式或升级新版本再试」，App 里登录失败（或只显示「接口返回错误」/「无法识别扫码状态」）。
+
+**原因**：网易云风控已停用旧的网页扫码方式（weapi `/login/qrcode/...`，type=1），在手机确认那一步直接拒绝，返回 8821。App 的直连模式和你服务器上的原版 Binaryify NeteaseCloudMusicApi 用的都是这种旧方式。原版仓库已归档不再更新；仍在维护的 NeteaseCloudMusicApiEnhanced（4.41.1）已改用 PC 客户端方式。
+
+**修复**
+- 扫码改为以 **PC 客户端**身份登录，与 Enhanced 4.41.1 的 `login_qr_key` / `login_qr_check` 同一套请求：eapi → `interfacepc.music.163.com`，`type=3`，客户端信息（os=pc、appver 3.1.17.204416、osver、channel、deviceId…）同时放在 Cookie 和加密的 `header` 里。
+- 二维码地址带 `chainId=v1_<deviceId>_pc_login_<毫秒>`；deviceId 每台设备固定一个（52 位十六进制，存在 UserDefaults `neteasePCDeviceID`）。
+- **两种模式都直接向网易云扫码**。自建网关模式下拿到的 Cookie 照常交给你的服务使用，服务器不用改。手机连不上网易云时（网络错误）自动退回用网关扫码。
+- 803 的 Cookie 从 `Set-Cookie` 读取；读取前去掉 `Domain` 属性，避免别的 music.163.com 子域的 Cookie 被丢掉。
+- 扫码检查的所有返回码都交给 `checkQRLogin`：8821 会明确提示「网易云拒绝了这次扫码登录」，其它码显示网易云给的原因，不再是笼统的接口错误。
+- 只有含 `MUSIC_U` 的登录 Cookie 才写入钥匙串。匿名接口和获取二维码时下发的设备 Cookie（NMTID 等）不再被当成登录保存。
+- 测试：更新二维码地址测试，新增 PC 端扫码请求与 Cookie 域名测试。
+- 顺带修掉 3.1.11 的编译警告：`BootView.halfArc` 被用作 `thumbFalloff` 的默认参数，而默认参数在主线程隔离之外求值 → 改为 `nonisolated private static let`（`Views/BootView.swift`，备份在同一回退目录的 `Views/`）。
+- 修掉运行时警告「AVAudioSession Hang Risk」：`StreamingPlayer` 的 `setActive(true/false)` 改到专用串行后台队列执行（同一队列保证停止时的停用排在下次播放的激活之前）；只设一次的 `setCategory` 仍同步执行，保证第一次 `play()` 前类别已就位。激活失败时下次播放自动重试（`Services/StreamingPlayer.swift`，备份在回退目录的 `Services/`）。
+
+未用 Xcode 编译，请先 Build，再真机扫码验证（网易云接口在这里连不上，没法实测）。
+
+---
+
+## 3.1.11 — 2026-11-12 图标与启动画面改为 Halo
+
+回退：把上一级目录 `iPodPlayer-stage3.1.10-backup-pre-3.1.11/` 里的文件放回原处（`Views/BootView.swift`；`Assets.xcassets/` 下的 `AppIcon.appiconset`、`LaunchBackground.colorset`、`LaunchMark.imageset`、`BootGlyphInk.imageset`）。`Info.plist` 本次没改。
+
+3.1.10 的图标（蓝底白转盘 + MENU/⏮/⏭/⏯）太老派，换成 **Halo**：
+- **图标**：转盘只剩本质 —— 一圈玻璃环 + 中间键，环里有一道蓝光，停在一点钟方向（就是 3.1.8 的拇指折射弧）。没有文字、没有按键符号。
+  - 浅色：浅银白底，白色环带柔和投影，中间键外一圈细凹槽。
+  - 深色：石墨底（顶部一点冷光），半透明玻璃环，外沿上方受光、内沿下方透光。
+  - 着色：黑底灰度，蓝光变白光。
+- **系统启动屏**：`LaunchMark` 换成 Halo 的环 + 中间键（不带蓝光），并新增深色版；`LaunchBackground` 也加了深色值（浅 #EEF0F3 / 深 #16181D）。启动屏跟随系统外观，和主屏幕上看到的图标一致。
+- **BootView**：
+  - 第一帧 = 系统启动屏（同一张图、同一位置、240pt）。它读取的是**系统**外观（屏幕的 traitCollection），不受 App 内主题强制深/浅色影响，因为启动屏是按系统外观画的。
+  - 加载中，蓝光绕着环转（1.25 秒一圈），渐变与图标完全同一套数学：横向高斯、纵向 (1−v²)²、外溢的柔光只在环外。
+  - 曲库就绪后，蓝光不是突然停下：等它转到离一点钟还差 1.4 rad 时开始减速（缓动的起始速度等于转动速度，没有顿挫），正好停在一点钟 —— **启动画面的最后一帧就是 App 图标**。然后中间键按一下，画面轻微放大并淡出。
+  - 若曲库在 0.55 秒内就绪，起始角度保证减速刚好在 0.55 秒开始，不会多等一圈。
+  - 减弱动态效果：蓝光一开始就停在一点钟，不转，直接淡出。
+  - "Repod" 字标改为 SF 19 semibold，颜色随外观。
+- `BootGlyphInk.imageset`（3.1.10 的白色按键符号）不再使用，已移到上一级 `_to_delete/`（Claude 不能删除文件，请手动删）。
+- `BootView(isReady:onFinished:)` 接口不变。图标生成脚本未放进工程。
+
+iOS 会缓存启动屏：装到设备上如果还是旧的，删掉 App 重装。
+
+未用 Xcode 编译，请先 Build。
+
+---
+
+## 3.1.10 — 2026-11-12 启动画面重做 + 新图标
+
+回退：把上一级目录 `iPodPlayer-stage3.1.9-backup-pre-3.1.10/` 里的文件放回原处（`Views/BootView.swift`、`Supporting/Info.plist`、`Assets.xcassets/AppIcon.appiconset`、`Assets.xcassets/LaunchBackground.colorset`），再删掉新增的 `LaunchMark.imageset`、`BootGlyphInk.imageset`。
+
+**新图标**：Repod 蓝（选中条同色渐变 #4A93FB → #195DD4）上一个白色转盘：MENU / ⏮ / ⏭ / ⏯ 四个标记 + 独立的中间键，中间键和转盘之间露出一圈蓝。去掉了旧图标里的"唱片 + 播放键"，一眼就是 iPod 转盘，29pt 也认得出。
+- 深色模式：黑蓝底、浅灰转盘，中间键外圈是蓝色。
+- 着色模式：重做为黑底灰度（旧的着色图是浅灰底，系统着色后会糊成一块）。
+- 三张都是 1024 不透明 PNG，系统自己切圆角；iOS 26 会自动加玻璃边。
+
+**启动画面**：不再是 iOS 5/6 锁屏（时钟 + 滑动来解锁），改成和图标同一个标记：
+- 系统启动屏（Info.plist `UILaunchScreen`）= `LaunchBackground` 底色 + 居中的 `LaunchMark`（200pt，@2x/@3x）。`BootView` 第一帧画的是同一张图、同一位置、同一大小，所以从系统交给 App 时看不出切换。
+- 加载时，一段蓝色玻璃弧（3.1.8 转盘触摸弧，用选中条的蓝）绕着转盘转，弧下面的标记变白，和列表行在选中条下变白一样；转盘后面亮起一点蓝光，下面是 SF Rounded 的 "Repod"，底部一行"正在准备曲库… · 版本号"。
+- 曲库就绪后（至少停留 0.55 秒）：弧淡出，中间键外圈填上蓝色（就是图标的样子），中间键"按"一下，整个画面轻微放大并淡出。
+- 减弱动态效果：弧停在 ⏭ 上不转，直接淡出。
+- `BootView(isReady:onFinished:)` 接口不变，`ContentView` 没改。`LaunchBackground` 调成稍亮的深蓝 (0.027, 0.067, 0.114)。
+- 文案里的"滑动来解锁 / 正在解锁…"不再使用，词条留在 `L10n.catalog` 里没删。
+
+注意：iOS 会缓存启动屏，装到设备上如果还是旧的，删掉 App 重装（或重启手机）再看。
+
+未用 Xcode 编译，请先 Build。
+
+---
+
+## 3.1.9 — 2026-11-12 字体细调
+
+回退：把上一级目录 `iPodPlayer-stage3.1.8-backup-pre-3.1.9/` 里的四个 Swift 文件放回原处（`ContentView.swift`；`Models/AppearanceSettings.swift`、`Models/PlayerState.swift`；`Views/ScreenView.swift`），`CHANGELOG.md` 也在里面。
+
+主字体仍是系统 SF（中文自动回退到苹方），只做三处细调：
+- **标题条与快速滚动字母泡改用 SF Rounded**：`AppFont.header`（列表标题条、Now Playing 顶行、音源名）加 `design: .rounded`；新增 `AppFont.indexBubble` 给 `LCDFastScrollIndex` 的字母泡。与转盘上的 MENU 一致，带一点经典 iPod 的味道；列表行不变，保证在玻璃上的可读性。苹方没有圆体，中文标题照常显示。
+- **简繁字形跟随 App 内语言**：`ContentView` 根部加 `.typesettingLanguage(...)`（iOS 17+）。App 里选繁體中文时，即使手机系统是简体，也用苹方繁体字形（反之亦然）；选 English 时不干预，沿用系统。`AppLanguage` 新增 `typesettingLanguage`。
+- **时间数字等宽**：Now Playing 的已播放/剩余时间与音量百分比早已是 `monospacedDigit()`，本次无需改动。
+
+未用 Xcode 编译，请先 Build。
+
+---
+
+## 3.1.8 — 2026-11-12 转盘触摸指示改为折射弧
+
+回退：把上一级目录 `iPodPlayer-stage3.1.7-backup-pre-3.1.8/` 文件夹里的两个文件放回 `iPodPlayer/Views/`（`ClickWheelView.swift`、`WheelLens.metal`）。只改了这两个文件。
+
+**改动**：触摸指示不再是拇指下一个圆形的放大点，而是一段**沿着转盘的折射弧**：
+- 径向铺满整条环带（从中间键边缘一直到外沿），沿环向是一段以拇指角度为中心的弧（默认半弧 0.8 rad ≈ 两侧各 46°，约占转盘四分之一）。
+- 在以转盘圆心为原点的极坐标里折射：沿环向把内容向拇指方向拉伸（经过的 MENU / 按键符号会顺着弧线弯过去），横向像一根弯玻璃棒，向环带中线轻微收拢。
+- 弧的两端用 `(1−v²)²`、内外两边用 `(1−u⁴)²` 渐隐，都是零斜率到零：没有边框、没有轮廓、没有阴影、没有蓝光。
+- 出现时弧从拇指处向两边展开（弧长随强度变化）；角度直接跟手，不会从上次的位置扫过来。保留了轻微色散；光沿整条弧分布，不再聚成一个白点。
+- Shader 改名 `wheelArcRefraction`；`WheelRefraction` 改为传入直径、内半径、角度、半弧和 0…1 的强度；`touchPoint` 已删除。弧长调 `ClickWheelView.refractionHalfArc` 即可。
+
+未用 Xcode 编译，请先 Build。
+
+---
+
+## 3.1.7 — 2026-11-12 Cover Flow 重写
+
+回退：只需把 `Views/CoverFlowView.swift` 换回上一级目录 `iPodPlayer-stage3.1.5-backup-pre-3.1.6.zip` 里的版本（这个包打在 3.1.6 菜单修复之前，别的文件不要从里面还原）。只改了 `Views/CoverFlowView.swift`（`CoverFlowLoop` 已删除，别处没有引用）。
+
+**修的两个问题**
+- **横屏进入 Cover Flow，中间不是正在播放的歌。** 原因：旧实现是 `ScrollView` + `LazyHStack` + 一个直接改 UIKit 滚动视图 bounds 的探针。滚动视图刚建好时偏移是 0，探针异步上报"居中的是第 0 格"，这比延迟的居中先到，于是记住的选中项被换成第一首；旋转过程中宽度变化又触发一次 reconcile，它"保留"了这个错的选中项。
+- **左边要滑一下才加载。** 原因：探针绕过 SwiftUI 直接移动滚动位置，`LazyHStack` 不知道发生了滚动，跳转目标左边的格子不会被创建，直到真的拖一下。
+
+**新实现**
+- 没有滚动视图了。位置就是一个小数格号（`CoverFlowMotion.position`）：拖动直接写它；松手 / 点击 / 无障碍步进交给一个临界阻尼弹簧（逐帧精确解，任何帧率都稳定，不过冲）。屏幕上看到的值就是这个值，所以滑行中可以随时接住，不会跳。
+- 每一帧都按位置把可见范围里的所有封面直接排出来，没有懒加载，左右两边一进来就在。
+- 进入 Cover Flow 永远先停在正在播放的歌上（同步决定，没有异步上报抢先）。
+- 停在正在播放的歌上时如果切歌（播完、锁屏下一首），封面会跟过去；用户在别处浏览时不打扰。
+
+**外观（经典 iPod Cover Flow）**
+- 中间一张正面；两侧封面转 64° 朝向中间、紧密叠成两摞，越往外越暗，屏幕边缘渐隐进黑色。
+- 所有封面站在同一条"地面"上，下面是更长的倒影；中间封面后面一圈很淡的光。
+- 点侧面的封面它会滑到中间；点中间的封面播放 / 暂停。
+- 标题胶囊在切换时淡入淡出；如果居中的是正在播放的歌，前面带一个小喇叭（暂停时是暂停符号）。
+- 少于 16 首时两端停住（带橡皮筋回弹），不再循环，所以同一张封面不会在屏幕上出现两次；16 首及以上照旧循环。
+
+未用 Xcode 编译，请先 Build。
+
+---
+
+## 3.1.6 — 2026-11-12 菜单滚动抖动
+
+**问题**：转盘滚动菜单列表时，选中条和列表都剧烈抖动。
+
+**原因**：3.1.5 把选中条放进滚动内容里，用弹簧滑到新的一行；但列表为了让选中行居中，每一步都用**瞬间**的 `scrollTo` 跳一行。结果每转一格：列表跳一行，选中条被带着往上跳一行，再弹簧滑回中间——选中条来回弹，列表一格一格地跳，快转时就是剧烈抖动。
+
+**修复**（`GlassKit.swift` → `ScrollViewProxy.lcdFollow`；`ScreenView` / `SearchView` / `SettingsView`）：
+- 转盘每一步的滚动改为和选中条**同一条弹簧、同一帧**开始：列表平滑滑动，选中条在屏幕上保持不动；到列表顶部/底部滚不动时，改为选中条滑动。
+- 弹簧改为临界阻尼（response 0.24，damping 1.0），不过冲，所以列表和选中条不会互相错开，快转时也不晃。
+- 首次出现、切到新页面时仍然直接跳到位（去掉一切继承的动画）。开启"减弱动态效果"时一律直接跳。
+
+未经 Xcode 编译，请先构建。
+
+---
+
+## 3.1.5 — 2026-11-12 键盘、正在播放整块、全玻璃转盘、边框、圆角、滚动闪烁
+
+一次修 6 个问题。回退：上一级目录 `iPodPlayer-stage3.1.4-backup-pre-3.1.5.zip`。
+
+**1. 键盘收起太慢**（`GlassKit.swift` → `LCDKeyboard`，`SearchView`，`ContentView`）
+- 原因：只把 `@FocusState` 设为 nil，要等下一次视图更新才生效，而那次更新恰好是最重的（重建搜索结果、切页），所以键盘晚一拍才开始收。
+- 现在先直接让第一响应者失焦（同一个 run loop 里就开始收），再做搜索/切页。
+- 触发点：点"搜索"/键盘搜索键、点结果、转盘离开输入行（任何页面里转盘一转就收，包括设置页的输入框）、按 MENU / 长按 MENU、中键重试搜索。
+- 结果列表拖动时键盘改为立即收起（`.immediately`），不再跟着手指慢慢往下拖。
+
+**2. 正在播放显示为一整块**（`NowPlayingView.swift`）
+- 去掉顶部玻璃条自己的底（毛玻璃、渐变、高光、分隔线、阴影）。标题和播放/模式图标直接放在封面光背景上，背景顶部本来就压暗，可读性不变。
+- 整个正在播放从顶边到底边是一块连续的画面，不再像"上面一块玻璃 + 下面一块屏"。布局高度不变。
+
+**3. 转盘整体改为玻璃，触摸指示改为无边界折射**（`ClickWheelView.swift`，新增 `Views/WheelLens.metal`）
+- 整个转盘是一块厚玻璃：透出机身颜色（略深一点，模拟玻璃吸光）、边缘一圈因厚度折射而加深、光穿过玻璃聚在右下、左上一片柔和表面高光、外沿在左上和右下各亮一次、中键周围玻璃向下凹。中键也换成同样的玻璃面（仍保留系统 glass 透镜边）。浅色机身用石墨灰字，深色机身用白字。
+- 触摸指示不再是一颗"小球"：手指下面的玻璃本身鼓起来，下面的转盘表面、按压光、按键标签被放大弯曲。没有外圈、没有阴影、没有轮廓——放大量从中心到边缘平滑降到 0（斜率也为 0），所以看不到任何边界。另加极轻的色散和中心聚光/肩部失光，让它像玻璃而不是单纯放大。
+- 用 Metal 着色器（`layerEffect`，iOS 17+）实现，所以在按压倾斜的 3D 变换里也能正常显示。只有强度做动画，中心直接跟手。
+- `WheelLens.metal` 已登记到 `project.pbxproj`（Views 组 + Sources）。
+
+**4. 屏幕黑边粗细不均**（`ContentView`，`GlassKit.swift` → `LCDBezel` / `LCDCoverGlass`）
+- 原因三个：左上有一条亮的高光线、右下没有，视觉上左上边变细；1pt 接触阴影往下偏 1pt，底边变粗；黑边是两个分别圆角的矩形之间的缝，圆角处不严格等宽。
+- 现在黑边用"屏幕轮廓的描边"画，描边是精确的等距偏移，四边和四个圆角都正好 4pt；外侧一条全周均匀的细线（银色机身为钢边）；内侧一条均匀的细边；去掉接触阴影，只留柔和的环境阴影。屏幕尺寸取整到整点。
+
+**5. 列表内容溢出圆角**（`ScreenView.swift` → `LCDEdgeFade`）
+- iOS 26 会在 `safeAreaInset` 放的标题栏下面自动加一层系统滚动边缘模糊，它由系统滚动视图绘制，不受 LCD 圆角裁切，列表行会从那层里透出圆角外。我们的玻璃标题栏本身就是这层效果，所以关掉系统的（`scrollEdgeEffectHidden`，仅 iOS 26+）。所有用 `lcdEdgeFade` 的列表（菜单、歌曲、设置）都生效。
+
+**6. 快速滚动时列表闪烁**（`GlassKit.swift` → `LCDLensHost`，各列表）
+- 原因：每一行自己画选中条，用 `matchedGeometryEffect` 串起来。转快了每一步都在拆一个、建一个；匹配动画用屏幕坐标，而 `scrollTo` 在下一次更新才移动行；懒加载列表还可能把"起飞"的那一行回收掉——于是闪。
+- 现在每个列表只有一个选中条，放在滚动内容里：选中行只上报自己的位置，选中条在内容坐标里滑过去，滚动时选中条和行一起动，转盘转动期间不再创建/销毁任何东西。弹簧阻尼调高（0.86），转得比它快时不会晃。
+- 菜单、歌曲/搜索结果、设置、音源列表都改用这个；搜索输入行在滚动区外，仍自己画选中条。
+
+未经 Xcode 编译，请先构建，有报错把报错贴回来。
+
+---
+
+## 3.1.4 — 2026-11-12 转盘触摸指示改为玻璃折射
+
+**修改**（`Views/ClickWheelView.swift`）：
+- 去掉跟随手指的蓝色光晕，换成一颗跟随手指的透明玻璃透镜。
+- 真折射效果：透镜里显示的是它下面转盘（漆面 + MENU/切歌/播放标签）放大 1.24 倍的样子，经过标签时标签会被"放大弯曲"。
+- 玻璃质感：边缘折射暗圈、左上高光与月牙反光、右下焦散亮弧、下方柔和投影；按下时弹性出现，松手淡出。
+- 不用系统 glass 效果：转盘在按压倾斜的 3D 变换里，系统玻璃会渲染成黑色，所以手工绘制。
+- 标签抽成 `keyLabels`，转盘和透镜共用。
+
+未经 Xcode 编译，请先构建。
+
+---
+
+## 3.1.3 — 2026-11-12 正在播放顶部裂缝
+
+**问题**：正在播放页顶部有一道明显的"裂缝"。
+
+**原因**：正在播放被 `safeTop`（灵动岛/状态栏后面那一条）整体往下推，那一条涂的是纯午夜黑，而下面是发光、漂移的封面模糊背景，两者硬接在一起。列表页这条被玻璃标题栏盖住，正在播放没有标题栏。
+
+**修改**：
+- `ScreenView`：不再给正在播放加 `.padding(.top, safeTop)`，改为把 `safeTop` 传进去。
+- `NowPlayingView`：封面背景铺满整块屏幕（含顶部那一条）；顶部加上与列表完全相同的玻璃标题栏（左"正在播放"，右播放/暂停 + 播放模式），用正在播放的午夜配色，封面光透过玻璃模糊显示。
+- 原来内容区里的大号状态图标移到玻璃栏里（与列表同尺寸），封面可用高度相应重新计算。
+
+未经 Xcode 编译，请先构建。
+
+---
+
+## 3.1.2 — 2026-11-12 首页侧栏图片重做
+
+**问题**：首页右侧预览图与 LCD 整体风格不搭。
+
+**原因**：预览栏自成一套——延伸到玻璃标题栏下面；用固定的近黑、浅蓝、浅灰配色，不随主题变；封面按竖长栏的高度裁成大方块并持续缩放漂移；音乐拼贴旋转 −7°、方块超出边界。
+
+**修改**（`Views/ScreenView.swift` → `HomePreviewPane`）：
+- 预览栏在标题栏下方，背景用主题的 `lcdBackground`，左侧一条与标题栏相同的细分隔线。
+- 每一项统一布局：居中的方形卡片（圆角 10、细描边、轻阴影）+ 下方两行说明（列表同款字号与主题文字色）。
+- 音乐：4 张封面 2×2 拼贴；播客：第一个节目封面 + 节目名/作者；正在播放：当前封面 + 歌名/歌手；播放模式：主题强调色的符号卡；设置：三台迷你 iPod 机身配色。
+- 去掉旋转、漂移、缩放；说明文字直接用列表已有的标题/副标题，不新增翻译。
+
+未经 Xcode 编译，请先构建。
+
+---
+
+## 3.1.1 — 2026-11-12 切页重叠修复
+
+**问题**：切换页面时新旧两页叠在一起（旧页还显示着新页的行）。
+
+**原因**：3.1 用 `.id(currentScreen)` + 带动画的 transition 换页。即使旧页设了 `removal: .identity`，只要换页那一帧带动画，SwiftUI 仍会把旧页留在层级里直到动画结束；旧页读的是同一个 view model，于是画出了新页的内容。开启"沉浸式正在播放"时，ContentView 的 `.animation(value: immersive)` 也会漏进换页。首页右侧预览栏是同一个问题。
+
+**修复**（只改 `Views/ScreenView.swift`）：
+- 换页事务一律不带动画（`.transaction(value: currentScreen) { $0.animation = nil }`），旧页同一帧消失。
+- 新增 `ScreenEntryMotion`：新页出现后自己滑入/淡入（push 从右、MENU 从左、正在播放淡入+缩放、标题跟随），观感与 3.1 相同。
+- 首页预览栏同样处理。
+- 选中光标滑动、正在播放背景漂移等其它动画不受影响。
+
+未经 Xcode 编译，请先构建。
+
+---
+
+## 3.1 — 2026-11-12 16:20
+
+iPod × Liquid Glass：换材质、加动效；**所有列表的行格式与顺序不变**。设计稿见 Project 文档 `claude/ui-redesign-liquid-glass.md`。
+
+> ⚠️ 本版在没有 Xcode 的环境里写成，**尚未编译**。先 `xcodebuild`，有报错把报错贴回来。回退：`iPodPlayer-stage3.0-backup-pre-glass.zip`。
+
+**选中条（蓝色玻璃透镜）**
+
+- `ThemePalette.selectionTop/Bottom` 改为饱和 iPod 蓝；新增 `selectionInk` / `selectionSecondaryInk`（白字）。各行不再写死 `Color.black`，统一读这两个 token（ScreenView / SearchView / SettingsView / SourceSwitcherView）
+- `LCDSelectionBar` 重画：上半高光、亮上沿、深蓝下唇、蓝色投影；`Metrics.selectionInset/Radius` 4/12 → 6/20
+- 透镜会「滑」：`ScreenView` 通过环境值 `lcdLens`（namespace + 当前屏）下发，行内透镜用 `matchedGeometryEffect` 配 0.24s 弹簧，快转时从当前位置改道而不是留下半透明残影。「减弱动态效果」下仍是瞬切
+
+**LCD**
+
+- 页眉改为浮在列表上的玻璃条（`safeAreaInset` + `.ultraThinMaterial` + 主题渐变 72%），列表从它下面滚过；标题与两个状态标记不变
+- LCD 嵌进 4pt 黑玻璃边框（`ContentView`），圆角仍与机身同心
+
+**根菜单：经典分屏**
+
+- `.home` 走 `homeSplit`：左 55% 是原来的菜单（条目与顺序完全不变：音乐 / 播客 / 设置 / 播放模式 / 正在播放），右侧 `HomePreviewPane` 跟着选中行换图：音乐=封面拼贴，播客=首个节目封面，正在播放=当前封面+歌名，播放模式=模式图标，设置=机身配色。右侧不可点
+
+**转盘**
+
+- 手指落在环上就有一团蓝色光斑跟着走（`touchGlow`），第一格计步之前转盘就有回应
+- 新增 `glass: Bool`：沉浸式播放页里环面与中心键换成透明玻璃。几何、五键、手势未动
+
+**动效**
+
+- 进入下一级：新列表从右侧 72pt 滑入并淡入，标题同向换入；MENU 返回从左侧进。旧屏立即离场（`removal: .identity`），否则它淡出时会读到下一屏的数据
+- 进/出正在播放：淡入 + 1.04 缩放
+
+**新功能**
+
+- 快速滚动字母泡：0.4s 内连转 4 格以上、且列表 ≥ 20 行时，屏幕中央出现玻璃字母泡（`LCDFastScrollIndex`），停转 0.65s 后消失
+- 正在播放背景：封面的缓慢漂移模糊 + 暗色罩（`NowPlayingBackdrop`）；封面颜色从 LCD 下沿漫到机身上
+- 沉浸式播放页（可选，默认关）：外观页**末尾**新增「沉浸式播放页」开关。开启后正在播放占满整机，转盘变透明玻璃，四段内容与顺序同 LCD 版
+
+**其它**
+
+- `MARKETING_VERSION` 3.0.0 → **3.1.0**，`CURRENT_PROJECT_VERSION` 20 → **21**
+- 没有新增文件，pbxproj 不需要登记
+- 真机待看：透镜滑动在万级歌曲列表里是否掉帧（掉帧就把 `LCDSelectionBackground.glide` 设为 nil）；玻璃页眉下的首行位置；分屏在 SE 尺寸下「Playback Mode」是否被截断；被选中行上的红心在蓝底上的对比度
+
+## 3.0 — 2026-11-11 19:35
+
+网易云直连：不填服务地址、不跑 Node/Docker 也能搜索、扫码登录和播放；自建网关保留为可选。
+
+**问题**
+
+- 2.x 每个用户都要自己部署 NeteaseCloudMusicApi，填地址、开端口；网关重启或地址变化就整片不可用
+- 播放地址、扫码换 cookie、听歌打卡原本都由网关代理；直连必须自己实现 weapi/eapi 签名、Set-Cookie 和 clientlog
+
+**做法**
+
+- 新增 `NetEaseTransport` 层：`NetEaseDirectTransport` + `NetEaseGatewayTransport`，`NetEaseClient.request` 只依赖协议；25 条路由保持网关式逻辑路径，由路由表映射到官方接口
+- `WeapiCrypto`：两次 AES-128-CBC + RSA-1024 裸模幂；`EapiCrypto`：AES-128-ECB + MD5 digest；黄金向量单测逐字节对齐
+- 直连覆盖 cloudsearch/search/detail/album/artist/playlist/推荐/电台/歌单分页；legacy `/song/url` 与 v1；扫码 unikey/clientlogin + Set-Cookie → CookieJar；`/like`、`/likelist`、`/scrobble`（clientlog eapi，startplay 与 play 两条日志）
+- 连接方式设置：默认直连；老用户地址非空自动迁移为网关；可手动切换，切换保留登录 cookie；网关地址行只在网关模式显示
+- 三语新增连接方式/直连/自建网关/切换提示；Info.plist 本地网络说明改为仅网关模式需要
+
+**其它**
+
+- `MARKETING_VERSION` 2.17.0 → **3.0.0**，`CURRENT_PROJECT_VERSION` 19 → **20**
+- 新增 `iPodPlayerTests`：20 tests，0 failures；含 weapi/eapi 黄金向量、CookieJar、模式迁移、网关表单契约、直连联网搜索/播放/只读登录（`REPOD_LIVE_DIRECT=1` 门控）
+- 17 Pro / SE3 `xcodebuild build` 0 error 0 Swift warning；仅系统 `appintentsmetadataprocessor` 提示
+- 截图：`.build/verify/v3-direct-settings.png`、`v3-gateway-settings.png`、`v3-mode-picker.png`、`v3-se3-direct-settings.png`
+- 真机待验收：803 扫码换 cookie、会员歌曲、红心写入、听歌打卡入账；直连在境外的版权差异
+
+## 2.17 — 2026-11-11 18:20
+
+封面倾斜的高光重做了：从「整片泛白」改成**随倾斜滑过的一道反光**。
+
+**问题**
+
+- 2.11 的高光是一条覆盖封面 60% 的 `LinearGradient`（白 0.22 → 0），静止时也挂着，倾斜时整块封面被洗白；而且起点终点跟着 lean 反号，倾斜过零时高光会突然翻面——看着不像玻璃，像一层雾
+
+**做法**
+
+- 静止时**完全没有高光**：`intensity = min(1, |lean| * 1.4)`，封面在桌面上就是干干净净的封面
+- 倾斜时叠两条同角度（24°）的斜带：一条宽的柔光（0.60 宽、blur 0.10、白 0.075）+ 一条窄的高光芯（0.15 宽、blur 0.012、白 0.20）；两条带一起随 lean 横向滑动（行程 0.42×封面宽），超出封面部分由圆角裁掉
+- 光带只朝一个方向渐隐，所以倾斜方向反转时是「移走」而不是「翻面」；幅度上限 5°，芯亮但面积小，不会盖住封面主体
+- Reduce Motion / 离开播放页 / 进后台时高光直接为 0（沿用 driver 的 stop）
+
+**其它**
+
+- `MARKETING_VERSION` 2.16.0 → **2.17.0**，`CURRENT_PROJECT_VERSION` 18 → **19**
+- 17 Pro 上用 fixture 核对四个姿态（0,0 / 0.9,0 / -0.9,0 / 0,0.8）：.build/verify/artwork-tilt-rest.png、-tilt-right.png、-tilt-left.png
+
+## 2.16 — 2026-11-11 16:26
+
+机身加一层斜向光泽，把「白色塑料」变成「有漆面的聚碳酸酯」。
+
+**机身光泽**
+
+- `ContentView` 在 `BodyLighting` 之后叠一条从左上到右下的 `LinearGradient`：白 0.22（0）→ 0.08（0.34）→ 0（0.58）。受光的左上角提亮、右下角回到本色，机身因此有了 iOS 5/6 塑料壳那种一整片漆面的反光，而不是一块均匀的色板
+- 只给浅色机身（经典白 / 银色 / 薄荷绿 / 落日橙）；午夜黑不加——深色机身上这层只会把黑打灰
+- 优先级排在 `BodyLighting` 之后、LCD 面板之前：面板和转盘不受影响，光泽只走机身露出来的区域
+- 低透明度 + 长过渡，不出现色带；「降低透明度」下没有额外处理（这层不是玻璃，是漆面高光）
+
+**其它**
+
+- `MARKETING_VERSION` 2.15.0 → **2.16.0**，`CURRENT_PROJECT_VERSION` 17 → **18**
+- 17 Pro 上核对四个浅色主题（.build/verify/body-sheen-classic.png / -silver.png / -mint.png / -sunset.png），SE3 薄荷绿核对小屏（body-sheen-se3-mint.png）
+- DEBUG 截图钩子补了 `music`（根菜单→音乐）与 `languages`（设置→语言）两个场景，用于逐屏核对；两屏在经典白/午夜黑下都正常（.build/verify/screen-music-classic.png、screen-languages-classic.png）。Release 不编译这段
+- Cover Flow 的「左侧没有相邻封面」确认是**截图钩子的时序伪影**：真机横屏冷启动两边都有邻居、居中正常（用户 2026-11-11 实机确认）。产品代码不动
+
+## 2.15 — 2026-11-11 16:18
+
+银色主题的收尾：LCD 边框从「黑塑料缝」换成**镀铬金属框**，转盘漆面也压深了一档。
+
+**镀铬边框**
+
+- `LCDCoverGlass` 新增 `bezelStyle: AnyShapeStyle?`：传了就用它画外框，没传仍是原来的黑色描边（经典白/午夜黑/薄荷绿/落日橙一律不变）
+- 银色传入 `LinearGradient(white 0.88 → 0.46, topLeading → bottomTrailing)`：受光的上左边缘是亮银，背光的下右边缘落到深灰——1pt 线也读得出「抛光的金属边」，不再是塑料缝
+- 播放页在银色机身里同样吃这个框：黑玻璃屏 + 银框，是 iPod video 那种屏幕观感；其它主题的播放页仍是黑边
+- 转盘 `wheelTint` 0.60/0.64/0.69 → 0.52/0.56/0.61，白转盘和钢灰机身的层次更清楚
+
+**其它**
+
+- `MARKETING_VERSION` 2.14.0 → **2.15.0**，`CURRENT_PROJECT_VERSION` 16 → **17**
+- 核对：17 Pro 上银色根菜单、银色的播放页、经典白与午夜黑（确认只有银色变化）；.build/verify/theme-silver-chrome.png、silver-chrome-nowplaying.png
+
+## 2.14 — 2026-11-11 16:08
+
+LCD 页眉补上 iOS 5/6 导航栏那道硬高光。
+
+**页眉高光**
+
+- `ScreenView` 的页眉在主题渐变之上叠一层 `LinearGradient`：顶部白 0.34（深色主题 0.10）→ 中线白 0.12（0.03）→ 0.52 处清零。上半段亮、下半段回到渐变本色，就是 iOS 5/6 那种「玻璃切成两半」的观感
+- 页眉底边补一条 1pt 投影发丝线（浅色 black 0.06 / 深色 black 0.18），高光收口处不会和分隔线糊在一起
+- 高光层与投影线都 `allowsHitTesting(false)`，不碰列表命中
+- 五种主题都核过：经典白与银色是明显的 Aqua 高光，午夜黑只留一点玻璃反光，薄荷绿/落日橙顺着各自的页眉渐变换色
+
+**其它**
+
+- `MARKETING_VERSION` 2.13.0 → **2.14.0**，`CURRENT_PROJECT_VERSION` 15 → **16**
+- 17 Pro 上核对根菜单三种主题的页眉（.build/verify/header-gloss-classic.png / -midnight.png / -silver.png）
+
+## 2.13 — 2026-11-11 16:02
+
+新增第五个主题「银色」，把 iOS 6/iPod classic 的钢银机身搬进来。
+
+**银色主题**
+
+- 机身：冷灰铝色，顶部 0.88/0.90/0.93 → 底部 0.55/0.59/0.64 的竖向渐变，配合 `BodyLighting` 的顶部柔光与底部暗角，读起来是一块拉丝金属而不是白塑料
+- LCD：比机身更冷的近白色（0.965/0.975/0.985），页眉从 0.99 渐变到 0.80/0.83/0.87（iOS 6 导航栏那种冷灰蓝），分隔线 0.55/0.58/0.62
+- 转盘：`wheelTint` 0.60/0.64/0.69，白色亮面环 + 冷灰漆面，中心键仍是高光白球——iPod classic 的「钢身 + 白转盘」组合
+- 强调色用 iOS 6 蓝 0.05/0.33/0.68；选中条仍是全主题通用的蓝色透镜；播放页保持固定午夜黑背光屏
+- 主题行色板自动取 `bodyBackground`，所以银色在选单里是一枚冷灰圆点，和经典白（白）、薄荷绿、落日橙都分得开
+
+**其它**
+
+- 「银色」补了 en（Silver）/ zh-Hant（銀色）译文
+- `MARKETING_VERSION` 2.12.0 → **2.13.0**，`CURRENT_PROJECT_VERSION` 14 → **15**
+- 核对：17 Pro 上根菜单、设置、外观（五个主题）、音源页截图；模拟器深色模式下银色不会被误判成午夜黑（`isDark = false`）
+
+## 2.12 — 2026-11-11 15:56
+
+音源页的提示语从「跟着列表的行尾」挪到面板页脚，Cover Flow 横屏外观做了系统核对。
+
+**音源页页脚**
+
+- `SourceSwitcherView` 里「按中键配置」原来是紧跟在音源行下面、带 10pt padding 的一行小字，看起来像列表第 3 行漏了标题；改成 `Spacer` 顶到底部、页脚 14pt 处居中，字号 11pt 半透明，读起来是「这台设备的操作提示」而不是列表内容
+- 音源行本身的布局、选中透镜、checkmark 语义都没动
+
+**Cover Flow 横屏核对（无产品改动）**
+
+- 模拟器不能命令行旋转，加了两条 DEBUG 钩子（Release 不编译，`strings` 已验证）：`REPOD_FORCE_LANDSCAPE=1` 把横屏构图用 90° 旋转画进竖屏画布、截图后转回；`REPOD_SCREEN_OVERRIDE=coverflow` 注入 5 张假专辑（本地 HTTP 服务供封面）
+- 核对结果：中央封面尺寸、两侧 3D 倾斜与缩放、倒影渐隐、底部信息胶囊、纯黑背景都成立，SE3 横屏同样成立；另用 2.4 宣传片的真机横屏帧做对照（`.build/verify/coverflow-device.png`）
+- 一个尚未定论的点：钩子场景里 Cover Flow 停在未居中的初始位置（左侧没有相邻封面）。真机宣传片里两侧都有邻居，初步判断是「视图先在开机页下面出现、滚动尚未居中」的时序差异；没有确凿证据前不动 `CoverFlowView` 的滚动逻辑，留待真机确认
+- `MARKETING_VERSION` 2.11.0 → **2.12.0**，`CURRENT_PROJECT_VERSION` 13 → **14**
+
+## 2.11 — 2026-11-11 15:42
+
+播放页的专辑封面会**跟着手机倾斜**动起来。
+
+**手感**
+
+- 封面（连同它背后的 blur 光晕）像一块实心卡片：左右倾、前后倾各最多 **5°**，带 `perspective 0.55` 的透视，外加 4pt 视差位移；封面上一层斜向高光会跟着倾角扫过
+- 标题、艺人、专辑、进度条、时间戳全部不动——动的只有封面，避免文字在小角度下抖
+- 进入播放页时把当时的手持角度记成"正"，所以刚打开时封面是平的，不会一进去就歪
+- 低通滤波（α 0.22）+ 死区（0.035）：手抖、放在桌上呼吸带来的微小重力变化都不会让封面颤
+
+**边界与耗电**
+
+- 只在播放页可见且 app 在前台时读取 CMMotionManager（30Hz），离开页面或切后台立刻停
+- 开启「降低动态效果」（Reduce Motion）时整个效果关闭，封面保持静止
+- 模拟器没有陀螺仪 → 自动跳过，不会报错
+
+**开发工具**
+
+- `ArtworkTilt.swift` 里带 DEBUG 钩子：`REPOD_FIXTURE_TILT="0.9,-0.4"` 冻结一个倾角用于截图；`REPOD_FIXTURE_TILT=auto` 让封面自己缓慢摆动用于录屏核对（Release 不编译）
+
+**验证**
+
+- Debug / Release 均 0 error 0 warning（唯一提示是 appintents 元数据跳过）
+- 截图：静置 / 右倾 0.9 / 后仰 −0.9 三种状态（.build/audit/tilt-*.png）与自动摆动的抽帧（.build/audit/tframes/）
+- **真机待确认**：把手机装到真机上，进播放页慢慢左右倾，确认 1) 封面跟手不延迟、2) 5° 幅度够不够、3) 高光扫过时颜色没被洗白；这三项模拟器测不了
+- `MARKETING_VERSION` 2.10.0 → **2.11.0**，`CURRENT_PROJECT_VERSION` 12 → **13**
+
+## 2.10 — 2026-11-11 15:30
+
+外观核对：**播放页四态无改动，主题选择器的色板改成能分清四个主题**。
+
+**外观核对（无改动）**
+
+- Now Playing 在英文 / 中文 / 超长标题 / 空态 / 已喜欢 / 音量条六种状态下逐个截图：封面色温、标题斜体（仅拉丁字母）、文案层级、进度条与时间戳都成立
+- 播放页固定用午夜黑配色是**有意**的「背光屏」：经典白主题下是黑面板 + 亮面黑转盘，和机身白形成对比；不随主题变化
+
+**改动**
+
+- 主题选择器的色板由 LCD 底色改成机身色：经典白（白）、午夜黑（黑）、薄荷绿（灰绿）、落日橙（蜜桃）。原来经典白和落日橙的 LCD 都接近白色，两个色板看起来一样
+- 色板 14pt → 16pt，选中行上仍保留描边，避免白/黑色板在面板和蓝色选中条上糊掉
+- LCD 面板加一圈 **1pt 细黑边**（`LCDCoverGlass` 外描边：浅色屏幕 `black 0.50`、深色屏幕 `black 0.55`）：白机身上面板原来是靠投影浮起来的，加了黑边之后像嵌进塑料里；深色主题下面板与机身同色，黑边补上了那道缝
+- 黑边只描边框，不参与玻璃高光/镜面内沿；「降低透明度」与浅深主题下都保留
+
+**开发工具（不进 Release）**
+
+- `PlayerViewModel.applyScreenshotFixtureIfRequested()` 在 `#if DEBUG` 内：用环境变量注入截图场景，模拟器不能点按也能核对界面
+  - `REPOD_SCREEN_OVERRIDE=nowPlaying|settings|appearance|sources|list`
+  - `REPOD_FIXTURE_TITLE/ARTIST/ALBUM/COVER`、`REPOD_FIXTURE_TRACK=empty`、`REPOD_FIXTURE_LIKED=1`、`REPOD_FIXTURE_VOLUME=1`
+  - 用法：`SIMCTL_CHILD_REPOD_SCREEN_OVERRIDE=appearance SIMCTL_CHILD_REPOD_THEME_OVERRIDE=经典白 xcrun simctl launch <udid> <bundle id>`
+- `MARKETING_VERSION` 2.9.0 → **2.10.0**，`CURRENT_PROJECT_VERSION` 11 → **12**
+
+**验证**
+
+- Debug / Release 均 0 error 0 warning
+- 截图：播放页六态（.build/audit/np-*.png）、设置/外观/音源/列表（.build/audit/scr-*.png）、主题选择器三主题（.build/audit/app-*.png）
+- 归档：.build/verify/appearance-themes-2.10.png
+
+## 2.9 — 2026-11-11 15:20
+
+LCD 底栏不再有那条「下巴接缝」，并把这个版本的四个主题逐一核对了一遍。
+
+**底栏**
+
+- 空闲时底栏完全隐形：不再画 1pt 分隔线，也不再铺 `footerBackground` 那层不同色的底，列表直接收在面板自己的圆角里
+- 有状态（转盘反馈 / 点赞确认 / 搜索中 / 载入中）时，分隔线与淡色底一起以 0.18s 淡入，仍占同一块高度——出现和消失都不会让上方列表跳动
+- 之前那条线读起来像机身接缝：它横跨整个面板，正好落在面板圆角开始收弧的位置
+
+**四主题核对（iPhone 17 Pro）**
+
+- 经典白：米白 LCD + 亮面黑转盘，选中透镜的经典蓝不随主题变
+- 午夜黑：深色 LCD + 浅磨砂转盘，底栏隐形后黑色面板终于是一整块
+- 薄荷绿：鼠尾草绿机身 + 淡薄荷 LCD，低对比但层次还在
+- 落日橙：暖奶油 LCD + 蜜桃机身
+- 截图留在 `.build/verify/theme-*.png`；四个主题的面板边、页眉渐变、选中透镜、按钮层都一致
+
+**版本**
+
+- `MARKETING_VERSION` 2.8.0 → **2.9.0**，`CURRENT_PROJECT_VERSION` 10 → **11**
+- 构建 0 error 0 warning；四个主题各冷启动截图核对
+
+## 2.8 — 2026-11-11 15:15
+
+换掉 App 图标：从「黑底细圆环」改成**转盘主体**，并补齐 iOS 18+ 的深色 / 着色变体。
+
+**设计**
+
+- 主体是 iPod 的转盘：黑色亮面外环 + 白色中心键，中心键里放一枚落日橙播放三角；背景是暖纸色渐变（顶部柔光 + 底部淡暗角），让转盘像摆在桌面上而不是浮在纯黑里
+- 光感沿用 2.1 起的外观语言：顶部弧形高光、外沿细亮线、中心键的内沿阴影与高光点，缩到 60pt 仍然读得出「转盘 + 播放」
+- 深色变体：深蓝极光底 + 烟灰玻璃转盘（沿用开机页的配色），中心键与橙三角保持不变
+- 着色（tinted）变体：灰阶版，交给系统上色
+- `Contents.json` 三张 1024 图：universal 亮色、`luminosity/dark`、`luminosity/tinted`
+
+**验证**
+
+- 构建 0 error 0 warning；装到 iPhone 17 Pro 模拟器核对主屏幕图标（浅色外观）
+- 深色变体在模拟器上不会自动切换（Home Screen 的图标外观设为「浅色」），实机在「深色图标」模式下生效；`assetutil` 确认 `Assets.car` 里三条 rendition 都在（UIAppearanceDark / ISAppearanceTintable）
+- `MARKETING_VERSION` 2.7.0 → **2.8.0**，`CURRENT_PROJECT_VERSION` 9 → **10**
+
+## 2.7 — 2026-11-11 15:05
+
+开机画面从「黑底大字」改成 **iOS 5/6 锁屏风**，材质用 iOS 26/27 的 Liquid Glass。
+
+**构图**
+
+- 深蓝极光壁纸：iOS 18+ 走 `MeshGradient`（3×3 网格），更早系统回退四段渐变；两团径向光斑以 12s 周期缓慢漂移（Reduce Motion 时不动）
+- 上方是日期 + 84pt thin 时间，白色垂直渐变填充 + 一层柔和投影（5/6 的 Helvetica UltraLight 气质，字形用系统 SF）
+- 中部整片留给壁纸，底部才是控件
+- 「滑动来解锁」条：玻璃胶囊轨道（`lcdGlass`，暗色 tint + 0.9pt 白色渐变描边 + 内部 multiply 阴影），46×40 圆角玻璃旋钮带深色 chevron，标签 2.6s 扫光
+- 底部两颗玻璃胶囊：左侧加载状态（mini `ProgressView` + 文案），右侧版本号（`Repod · 2.7.0`）
+
+**交互**
+
+- 仍不做手势解锁：曲库就绪后旋钮自己滑到右端（0.38s），锁屏再 0.35s 淡出；最短停留 0.7s，避免小曲库时闪一帧
+- 加载中 -> 解锁中，左侧胶囊文案从「正在准备曲库…」换成「正在解锁…」；标签在解锁时渐隐
+- 解锁任务以「曲库就绪」为 key（`.task(id: isReady)`）：无论就绪先到还是 0.7s 先到，都会重新起一次任务并正常解锁，不会互相错过卡在锁屏
+- 环境动效延迟 0.8s 再启动：首帧就跑 repeatForever 会让慢设备上的系统启动转场拖尾
+
+**修掉的两个问题**
+
+- 壁纸光斑原来用 `.blur(radius: 90/80)` 的椭圆，blur 采样越界会在窗口左/下缘染出浅灰白边；改成 `RadialGradient` 填充的圆后消失
+- ZStack 最底层加一层与启动图同色的基础色打底，系统启动转场期间不会露出窗口底色
+
+**系统启动图**
+
+- `LaunchBackground` 改成 `#04060B` 同系深蓝（sRGB 0.008 / 0.014 / 0.026），与锁屏底色对齐，启动图到锁屏页几乎无缝
+
+**文案与版本**
+
+- 新增 `L10n`：`滑动来解锁`（Slide to Unlock / 滑動來解鎖）、`正在解锁…`（Unlocking… / 正在解鎖…）
+- `MARKETING_VERSION` 2.6.0 → **2.7.0**，`CURRENT_PROJECT_VERSION` 8 → **9**
+
+**验证**
+
+- iPhone 17 Pro（1206×2622）与 iPhone SE (3rd)（750×1334）模拟器冷启动截图核对：锁屏页全屏、无灰边、壁纸/时间/滑锁/胶囊排布正常；解锁末段截图确认旋钮到右端、标签隐去、胶囊切到「正在解锁…」
+- `xcodebuild` 全新建构 0 error 0 warning（只剩 appintents 的 "Metadata extraction skipped" 提示）
+- 说明：`simctl` 仍不能拖动、点按，滑锁只用到了自动解锁路径；真机手感需实测
+
+## 2.6 — 2026-11-09 22:08
+
+**开机画面的大字也由 `iPod` 改为 `Repod`。**
+
+- `BootView` 的标题改为 `Repod`，与 LCD 顶部的设备名一致；仍是 46pt 粗体、白字、居中，下面那行版本号不变
+- 系统启动图（`UILaunchScreen` 只有 `LaunchBackground` 一个底色、无文字）不需要改，黑底切换处依旧无缝
+- `MARKETING_VERSION` 2.5.0 → **2.6.0**，`CURRENT_PROJECT_VERSION` 7 → **8**
+- 模拟器冷启动过程逐帧截图核对，启动页显示 `Repod`；`xcodebuild` 全新建构 0 error 0 warning
+
+## 2.5 — 2026-11-09 22:02
+
+LCD 顶部的设备名由 `iPod` 改为 **`Repod`**。
+
+- `AppScreen.title` 的 `.home` 分支改为 `"Repod"`：根菜单标题、无障碍标题一致；`L10n.untranslated` 里本来就锁着 `Repod`，所以任何语言下都不会被翻译
+- 启动页（`BootView`）的大字仍是 `iPod`：那是开机画面上的产品名，不属于菜单标题，本次未动
+- `MARKETING_VERSION` 2.4.0 → **2.5.0**，`CURRENT_PROJECT_VERSION` 6 → **7**
+- 模拟器核对根菜单标题已是 `Repod`；`xcodebuild` 全新建构 0 error 0 warning
 
 ## 2.4 — 2026-11-09 20:18
 
@@ -267,7 +900,7 @@ m802.music.126.net  connect=3ms  ttfb=57ms
 → 200，TTFB 76–175ms                     （服务本身活着，也没有变慢）
 ```
 
-- 间隔 4 秒照样一半失败，说明不是「客户端刷太快」，而是这台机器的出口 IP 被网易云标记了。（开发者自测时自建的）API 服务器的每一次 `/song/url` 都由它代发到网易云，风控判的是它
+- 间隔 4 秒照样一半失败，说明不是「客户端刷太快」，而是这台机器的出口 IP 被网易云标记了。`39.108.221.50` 的每一次 `/song/url` 都由它代发到网易云，风控判的是它
 - 这解释了「界面不卡、只是静音、每次切歌都一样」：地址被拒 → 客户端进入静默恢复阶梯 → 等 1.5 秒再来一次 → 又有一半概率被拒
 - 也解释了为什么上一版「地址预取提前到 3 秒」没有明显效果：预取同样有一半概率被拒，而只要被拒一次，原来的实现会**把预取整体静音 2 分钟**，于是那 2 分钟里每一次切歌都是冷的
 
@@ -296,7 +929,7 @@ m802.music.126.net  connect=3ms  ttfb=57ms
 
 **需要你在服务端确认的**
 
-- 自建服务器是不是长期用同一个出口 IP 在跑。被标记的是它，客户端改不动：换一个干净的出口（或让它走代理 / 走 Tailscale 到另一台机器出网）是根治
+- 这台机器是不是长期拿着 `39.108.221.50` 这个出口 IP 在跑。被标记的是它，客户端改不动：换一个干净的出口（或让它走代理 / 走 Tailscale 到另一台机器出网）是根治
 - 匿名请求被拒的概率明显更高。用真机登录状态再量一次同样的 8 次请求，如果被拒比例掉到 0–1/8，那 `歌曲` 的慢还有一部分来自「有时没带上登录」
 - 服务端日志里搜 `-460`，看是不是和自己看到的频率一致
 

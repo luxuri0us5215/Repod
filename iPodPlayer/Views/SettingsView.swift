@@ -11,6 +11,7 @@ struct SettingsView: View {
     @AppStorage("spotifyRedirectURI") private var spotifyRedirectURI = "ipodplayer://spotify-login-callback"
     @FocusState private var focusedField: SettingsField?
     @State private var showsColorPicker = false
+    @State private var showsNetEaseModePicker = false
 
     private enum SettingsField: Hashable {
         case neteaseAddress, spotifyClientID, spotifyRedirectURI
@@ -39,11 +40,15 @@ struct SettingsView: View {
 
                         if entry.action == .setting(.neteaseAddress) {
                             status(viewModel.neteaseLoginStatus)
+                        } else if entry.action == .setting(.neteaseMode), viewModel.neteaseMode == .direct {
+                            status(viewModel.neteaseLoginStatus)
                         } else if entry.action == .setting(.spotifyRedirectURI) {
                             status(viewModel.spotifyStatus)
                         }
                     }
                 }
+                // 3.1.5: one lens for the whole list, in the scroll content.
+                .lcdLensHost()
                 .foregroundStyle(appearance.theme.lcdText)
                 .padding(.bottom, 10)
             }
@@ -53,9 +58,16 @@ struct SettingsView: View {
             .lcdEdgeFade(appearance.theme.lcdBackground)
             .scrollDismissesKeyboard(.interactively)
             .onChange(of: selectedIndex) { _, index in
-                proxy.scrollTo(index, anchor: .center)
+                proxy.lcdFollow(index, anchor: .center, animated: true)
             }
-            .onAppear { proxy.scrollTo(selectedIndex, anchor: .center) }
+            .onAppear {
+                proxy.lcdFollow(selectedIndex, anchor: .center, animated: false)
+                #if DEBUG
+                if ProcessInfo.processInfo.arguments.contains("-repod-show-mode-picker") {
+                    showsNetEaseModePicker = true
+                }
+                #endif
+            }
         }
         .onReceive(viewModel.settingsActions, perform: activate)
         .onChange(of: focusedField) { _, field in
@@ -70,6 +82,12 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $showsColorPicker) {
             SettingsColorPicker(selection: $appearance.customAccent)
+        }
+        .confirmationDialog("选择连接方式", isPresented: $showsNetEaseModePicker, titleVisibility: .visible) {
+            ForEach(NetEaseConnectionMode.allCases, id: \.rawValue) { mode in
+                Button(mode.displayName) { viewModel.setNetEaseMode(mode) }
+            }
+            Button("取消", role: .cancel) {}
         }
         .onDisappear { viewModel.settingsChanged() }
     }
@@ -99,13 +117,14 @@ struct SettingsView: View {
     private func rowLabel(_ entry: MenuEntry, selected: Bool) -> some View {
         HStack(spacing: 6) {
             if case .setting(.theme(let preset)) = entry.action {
+                // The body colour is what tells the four themes apart: the LCD
+                // colours are all near-white except midnight, so classic and sunset
+                // read as the same chip. The rim keeps the white/dark chips legible
+                // on the panel and on the blue selection lens.
                 Circle()
-                    .fill(preset.palette.lcdBackground)
-                    .frame(width: 14, height: 14)
-                    // The classic swatch is nearly the same white as the LCD, so it
-                    // needs a rim to be visible at all — and again on the blue
-                    // selection bar it may sit on.
-                    .overlay(Circle().strokeBorder(selected ? Color.black.opacity(0.30)
+                    .fill(preset.palette.bodyBackground)
+                    .frame(width: 16, height: 16)
+                    .overlay(Circle().strokeBorder(selected ? Color.white.opacity(0.70)
                                                             : appearance.theme.divider,
                                                    lineWidth: 1))
             }
@@ -121,7 +140,7 @@ struct SettingsView: View {
             } else if let detail = entry.detail {
                 Text(verbatim: detail)
                     .font(AppFont.detail)
-                    .foregroundStyle(selected ? Color.black : appearance.theme.lcdSecondaryText)
+                    .foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText)
             }
             if entry.marked {
                 Image(systemName: "checkmark").font(.system(size: 14, weight: .bold))
@@ -131,11 +150,11 @@ struct SettingsView: View {
                 }
             } else if entry.action == .setting(.customAccentColor) {
                 Circle().fill(appearance.customAccent).frame(width: 20, height: 20)
-                    .overlay(Circle().strokeBorder(selected ? Color.black : appearance.theme.lcdSecondaryText, lineWidth: 1))
+                    .overlay(Circle().strokeBorder(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText, lineWidth: 1))
             } else if entry.showsChevron {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(selected ? Color.black : appearance.theme.lcdSecondaryText)
+                    .foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText)
             }
         }
     }
@@ -145,8 +164,8 @@ struct SettingsView: View {
         Group {
             switch entry.action {
             case .setting(.neteaseAddress):
-                TextField("http://your-server:3000", text: $neteaseBaseURL,
-                          prompt: Text("http://your-server:3000").foregroundStyle(selected ? Color.black : appearance.theme.lcdSecondaryText))
+                TextField("http://<云电脑 Tailscale IP>:3000", text: $neteaseBaseURL,
+                          prompt: Text("http://<云电脑 Tailscale IP>:3000").foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText))
                     .keyboardType(.URL)
                     .submitLabel(.done)
                     .focused($focusedField, equals: .neteaseAddress)
@@ -154,14 +173,14 @@ struct SettingsView: View {
                     .accessibilityLabel("网易云服务地址")
             case .setting(.spotifyClientID):
                 TextField("客户端标识", text: $spotifyClientID,
-                          prompt: Text("客户端标识").foregroundStyle(selected ? Color.black : appearance.theme.lcdSecondaryText))
+                          prompt: Text("客户端标识").foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText))
                     .keyboardType(.asciiCapable)
                     .focused($focusedField, equals: .spotifyClientID)
                     .simultaneousGesture(TapGesture().onEnded { selectField(.spotifyClientID) })
                     .accessibilityLabel("Spotify 客户端标识")
             case .setting(.spotifyRedirectURI):
                 TextField("回调地址", text: $spotifyRedirectURI,
-                          prompt: Text("回调地址").foregroundStyle(selected ? Color.black : appearance.theme.lcdSecondaryText))
+                          prompt: Text("回调地址").foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText))
                     .keyboardType(.URL)
                     .focused($focusedField, equals: .spotifyRedirectURI)
                     .simultaneousGesture(TapGesture().onEnded { selectField(.spotifyRedirectURI) })
@@ -211,9 +230,13 @@ struct SettingsView: View {
         case .followSystem: appearance.followsSystem.toggle()
         case .theme(let preset): appearance.selectedTheme = preset
         case .customAccentEnabled: appearance.useCustomAccent.toggle()
+        case .immersiveNowPlaying: appearance.immersiveNowPlaying.toggle()
         case .customAccentColor:
             focusedField = nil
             showsColorPicker = true
+        case .neteaseMode:
+            focusedField = nil
+            showsNetEaseModePicker = true
         case .neteaseAddress: focusedField = .neteaseAddress
         case .spotifyClientID: focusedField = .spotifyClientID
         case .spotifyRedirectURI: focusedField = .spotifyRedirectURI
@@ -243,7 +266,7 @@ private struct SettingsLCDRowStyle: ButtonStyle {
         configuration.label
             .font(AppFont.title)
             .lineLimit(1)
-            .foregroundStyle(selected ? Color.black : appearance.theme.lcdText)
+            .foregroundStyle(selected ? appearance.theme.selectionInk : appearance.theme.lcdText)
             .padding(.horizontal, Metrics.horizontalInset)
             .frame(height: height)
             .frame(maxWidth: .infinity, alignment: .leading)

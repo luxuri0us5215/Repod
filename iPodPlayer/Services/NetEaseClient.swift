@@ -16,6 +16,15 @@ enum NetEaseQRStatus {
 final class NetEaseClient {
     private var baseURL: String
     private var session: URLSession
+    private(set) var mode: NetEaseConnectionMode
+    private var transport: NetEaseTransport
+    /// 3.1.12: QR login always talks to NetEase as the PC client, in both modes.
+    /// The original NeteaseCloudMusicApi gateway still logs in the old web way,
+    /// which NetEase now refuses after the scan (8821). The cookie it yields is the
+    /// same account cookie, so the gateway uses it exactly as before.
+    private var qrTransport: NetEaseTransport
+    /// Which transport issued the current code; its check polls must go to the same one.
+    private var qrUsesGateway = false
     private var cookie = ""
     private var generation = UUID()
     private var isLoggingOut = false
@@ -165,11 +174,21 @@ final class NetEaseClient {
         }
     }
 
-    init(baseURL: String) {
-        self.baseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        session = Self.makeSession()
-        cookie = (try? NetEaseCookieKeychain.read()) ?? ""
+    init(mode: NetEaseConnectionMode, baseURL: String) {
+        let value = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.mode = mode
+        self.baseURL = value
+        let session = Self.makeSession()
+        self.session = session
+        self.cookie = (try? NetEaseCookieKeychain.read()) ?? ""
+        self.transport = Self.makeTransport(mode: mode, baseURL: value, session: session)
+        self.qrTransport = NetEaseDirectTransport(session: session)
         observeMemoryPressure()
+    }
+
+    convenience init(baseURL: String) {
+        let value = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.init(mode: value.isEmpty ? .direct : .gateway, baseURL: value)
     }
 
     deinit {
@@ -204,10 +223,18 @@ final class NetEaseClient {
 
     func configure(_ baseURL: String) {
         let value = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard value != self.baseURL else { return }
+        configure(mode: value.isEmpty ? .direct : .gateway, baseURL: value)
+    }
+
+    func configure(mode: NetEaseConnectionMode, baseURL: String) {
+        let value = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value != self.baseURL || mode != self.mode else { return }
+        self.mode = mode
         self.baseURL = value
         session.invalidateAndCancel()
         session = Self.makeSession()
+        transport = Self.makeTransport(mode: mode, baseURL: value, session: session)
+        qrTransport = NetEaseDirectTransport(session: session)
         generation = UUID()
         userID = nil
         likedPlaylistTracksCache = nil
@@ -223,6 +250,8 @@ final class NetEaseClient {
     func resetSession() {
         session.invalidateAndCancel()
         session = Self.makeSession()
+        transport = Self.makeTransport(mode: mode, baseURL: baseURL, session: session)
+        qrTransport = NetEaseDirectTransport(session: session)
         clearAuthentication()
     }
 
@@ -248,6 +277,19 @@ final class NetEaseClient {
         configuration.urlCache = nil
         configuration.timeoutIntervalForRequest = 25
         return URLSession(configuration: configuration)
+    }
+
+    private static func makeTransport(
+        mode: NetEaseConnectionMode,
+        baseURL: String,
+        session: URLSession
+    ) -> NetEaseTransport {
+        switch mode {
+        case .gateway:
+            return NetEaseGatewayTransport(baseURL: baseURL, session: session)
+        case .direct:
+            return NetEaseDirectTransport(session: session)
+        }
     }
 
     private var artistIDByName: [String: String] = [:]
@@ -1217,12 +1259,23 @@ final class NetEaseClient {
     func createQRLogin() async throws -> NetEaseQRLogin {
         // Finish clearing a pending logout before starting another QR flow.
         if isLoggingOut { resetSession() }
-        let keyBody = try await request("/login/qr/key")
+        let keyBody: [String: Any]
+        do {
+            qrUsesGateway = false
+            keyBody = try await request("/login/qr/key", via: qrTransport)
+        } catch let error as ClientError {
+            // A phone that cannot reach NetEase itself (the reason some people run a
+            // gateway) still gets the gateway's login rather than no login at all.
+            guard mode == .gateway, case .transport = error else { throw error }
+            qrUsesGateway = true
+            keyBody = try await request("/login/qr/key")
+        }
         guard let keyData = keyBody["data"] as? [String: Any],
               let key = keyData["unikey"] as? String, !key.isEmpty else {
             throw ClientError.message("服务未返回二维码密钥，请检查服务版本后重试。")
         }
-        let createBody = try await request("/login/qr/create", parameters: ["key": key])
+        let createBody = try await request("/login/qr/create", parameters: ["key": key],
+                                           via: qrUsesGateway ? nil : qrTransport)
         guard let data = createBody["data"] as? [String: Any],
               let url = data["qrurl"] as? String, Self.mediaURL(url) != nil else {
             throw ClientError.message("服务未返回二维码地址，请稍后重试。")
@@ -1232,10 +1285,12 @@ final class NetEaseClient {
 
     func checkQRLogin(key: String) async throws -> NetEaseQRStatus {
         let requestGeneration = generation
-        let body = try await request("/login/qr/check", parameters: ["key": key])
+        let body = try await request("/login/qr/check", parameters: ["key": key],
+                                     via: qrUsesGateway ? nil : qrTransport)
         try Task.checkCancellation()
         guard generation == requestGeneration else { throw CancellationError() }
-        switch (body["code"] as? NSNumber)?.intValue {
+        let code = (body["code"] as? NSNumber)?.intValue
+        switch code {
         case 800: return .expired
         case 801: return .waiting
         case 802: return .scanned
@@ -1256,7 +1311,19 @@ final class NetEaseClient {
             playlistLikedTracks = [:]
             playlistUnlikedTrackIDs = []
             return .authorized
-        default: throw ClientError.message("无法识别扫码状态，请重新生成二维码。")
+        case 8821:
+            // NetEase's risk control turned this login down after the scan
+            // (「请切换其他登录方式或升级新版本再试」).
+            throw ClientError.message(qrUsesGateway
+                ? "网易云拒绝了这次扫码登录（8821）。自建服务的扫码方式已被网易云停用，请把服务升级到 NeteaseCloudMusicApiEnhanced，或让手机能直接访问网易云后重试。"
+                : "网易云拒绝了这次扫码登录（8821）。请稍后重新生成二维码再试。")
+        default:
+            let detail = (body["message"] as? String) ?? (body["msg"] as? String)
+            if let code, let detail, !detail.isEmpty {
+                throw ClientError.message("网易云未通过这次扫码登录（\(code)）：\(detail)")
+            }
+            if let code { throw ClientError.message("网易云未通过这次扫码登录（\(code)），请重新生成二维码。") }
+            throw ClientError.message("无法识别扫码状态，请重新生成二维码。")
         }
     }
 
@@ -1269,37 +1336,12 @@ final class NetEaseClient {
 
     private func request(_ path: String, parameters: [String: String] = [:], requiresLogin: Bool = false,
                          preservesLogin: Bool = false,
-                         timeout: TimeInterval? = nil) async throws -> [String: Any] {
-        guard !baseURL.isEmpty else {
-            throw ClientError.message("请先到“设置 → 网易云设置”填写自己的服务地址。")
-        }
+                         timeout: TimeInterval? = nil,
+                         via override: NetEaseTransport? = nil) async throws -> [String: Any] {
         // Entering the same playlist or the playlists screen again is a repeat of a
         // question whose answer has not changed. Serving it from memory removes the
         // whole round trip instead of merely making it faster.
         if let cached = cachedResponse(path: path, parameters: parameters) { return cached }
-        guard var components = URLComponents(string: baseURL),
-              ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
-              let host = components.host, !host.isEmpty,
-              components.user == nil, components.password == nil,
-              components.query == nil, components.fragment == nil else {
-            throw ClientError.message("服务地址无效，请填写完整的网页服务地址，不要包含账号、密码或查询参数。")
-        }
-        components.path = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        components.path = (components.path.isEmpty ? "" : "/" + components.path) + path
-        components.queryItems = parameters.sorted(by: { $0.key < $1.key }).map {
-            URLQueryItem(name: $0.key, value: $0.value)
-        } + [URLQueryItem(name: "timestamp", value: String(Int(Date().timeIntervalSince1970 * 1_000)))]
-        guard let url = components.url else { throw ClientError.message("服务地址无效。") }
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
-        // The API server only forwards a `cookie` form field to NetEase. A Cookie header
-        // is ignored, and URLSession drops it, so those GETs came back 301 and wiped a valid login.
-        if !cookie.isEmpty {
-            request.httpMethod = "POST"
-            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-            var body = URLComponents()
-            body.queryItems = [URLQueryItem(name: "cookie", value: cookie)]
-            request.httpBody = body.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B").data(using: .utf8)
-        }
         let requestGeneration = generation
         do {
             // Library calls wait out an in-flight song address. They share one small server,
@@ -1311,37 +1353,51 @@ final class NetEaseClient {
             }
             try Task.checkCancellation()
             guard generation == requestGeneration else { throw CancellationError() }
-            let (data, response) = try await sendWithRetry(request, timeout: timeout)
+            let result = try await (override ?? transport).send(
+                path: path,
+                parameters: parameters,
+                cookie: cookie,
+                timeout: timeout
+            )
             try Task.checkCancellation()
             guard generation == requestGeneration else { throw CancellationError() }
+            guard let body = result.body else {
+                throw ClientError.message("服务返回格式无效，请确认地址指向兼容的网易云接口服务。")
+            }
             // A -460 is a short rate window about the caller, not a verdict on this song.
             // It is reported once and the player recovers on its own: retrying inside
             // this function would put a second request into the window that refuses it.
-            guard let response = response as? HTTPURLResponse else {
-                throw ClientError.message("网易云服务请求失败，请检查服务运行状态和网络连接。")
-            }
-            if !(200...299).contains(response.statusCode),
-                let body = try? await Self.parseObject(data),
-                (body["code"] as? NSNumber)?.intValue == -460 {
+            if !(200...299).contains(result.statusCode),
+               (body["code"] as? NSNumber)?.intValue == -460 {
                 noteRiskRefusal()
                 throw ClientError.riskControl
             }
-            if [301, 401, 403].contains(response.statusCode), requiresLogin || path == "/login/status" || preservesLogin {
+            if [301, 401, 403].contains(result.statusCode), requiresLogin || path == "/login/status" || preservesLogin {
                 if !preservesLogin { clearAuthentication() }
                 throw ClientError.loginRequired
             }
-            guard (200...299).contains(response.statusCode) else {
+            guard (200...299).contains(result.statusCode) else {
                 throw ClientError.message("网易云服务请求失败，请检查服务运行状态和网络连接。")
             }
-            let parsed = try await Self.parseObject(data)
-            // Parsing suspends: a logout or address change meanwhile makes this answer stale.
-            try Task.checkCancellation()
-            guard generation == requestGeneration else { throw CancellationError() }
-            guard let body = parsed else {
-                throw ClientError.message("服务返回格式无效，请确认地址指向兼容的网易云接口服务。")
+            if let updated = result.updatedCookie {
+                if updated.isEmpty {
+                    cookie = ""
+                    try? NetEaseCookieKeychain.delete()
+                } else if updated != cookie {
+                    cookie = updated
+                    // 3.1.12: only a session cookie is worth keeping. The QR key and
+                    // anonymous direct calls hand out device cookies (NMTID and the
+                    // like); saved, they looked like a login on the next launch.
+                    if path != "/login/qr/check", path != "/login/qr/key",
+                       NetEaseCookieJar.parse(updated).contains(where: { $0.name == "MUSIC_U" && !$0.value.isEmpty }) {
+                        try? NetEaseCookieKeychain.save(updated, baseURL: baseURL)
+                    }
+                }
             }
             let code = (body["code"] as? NSNumber)?.intValue ?? 200
-            guard code == 200 || (path == "/login/qr/check" && (800...803).contains(code)) else {
+            // Every QR check answer goes to `checkQRLogin`, which names refusals such
+            // as 8821 instead of reporting a generic interface error.
+            guard code == 200 || (path == "/login/qr/check" && code != -460 && code != 301) else {
                 if code == -460 {
                     noteRiskRefusal()
                     throw ClientError.riskControl
@@ -1353,7 +1409,7 @@ final class NetEaseClient {
                 }
                 throw ClientError.message("网易云接口返回错误（\(code)），请检查登录、版权和服务版本。")
             }
-            storeResponse(body, path: path, parameters: parameters, byteCount: data.count)
+            storeResponse(body, path: path, parameters: parameters, byteCount: result.byteCount)
             // One served answer is the only evidence available that the window has
             // lifted, so lift it here rather than waiting out the whole mute: the next
             // switch can be prefetched again.
@@ -1363,6 +1419,13 @@ final class NetEaseClient {
             throw CancellationError()
         } catch let error as URLError where error.code == .cancelled {
             throw CancellationError()
+        } catch let error as NetEaseTransportError {
+            switch error {
+            case .loginRequired:
+                throw ClientError.loginRequired
+            case .missingBaseURL, .invalidBaseURL, .invalidResponse, .unsupportedRoute, .message:
+                throw ClientError.message(error.localizedDescription)
+            }
         } catch let error as URLError where Self.isTransportFailure(error) {
             // Named apart from the generic message so playback can retry quietly
             // instead of treating it as "this song has no address".
@@ -1388,62 +1451,11 @@ final class NetEaseClient {
         }
     }
 
-    /// The subset worth re-sending at once. A timeout is excluded on purpose: it means
-    /// the server is slow, and a second attempt would only double the silence the
-    /// listener is already sitting in.
-    private static func isWorthRetrying(_ error: URLError) -> Bool {
-        switch error.code {
-        case .networkConnectionLost, .cannotConnectToHost,
-             .cannotFindHost, .dnsLookupFailed, .secureConnectionFailed:
-            return true
-        default:
-            return false
-        }
-    }
-
-    /// One extra attempt for a request that died in transit.
-    ///
-    /// Every authenticated NetEase call is a POST, and URLSession only re-sends a GET
-    /// by itself — so a server restarting, or a carrier middlebox resetting a plain
-    /// HTTP reply halfway through (the `5129/0 bytes … -1005` case), used to cost the
-    /// caller the entire round trip on top of the wait it had already served. The
-    /// broken socket is evicted from the pool by the failure itself, so the retry
-    /// dials fresh rather than reusing it. A refusal that did come back as an answer
-    /// never reaches this path, so this cannot turn a -460 into a burst.
-    private func sendWithRetry(_ urlRequest: URLRequest, timeout: TimeInterval?,
-                               attempts: Int = 2) async throws -> (Data, URLResponse) {
-        var urlRequest = urlRequest
-        if let timeout { urlRequest.timeoutInterval = timeout }
-        var lastError: URLError?
-        for attempt in 1...max(1, attempts) {
-            do {
-                return try await session.data(for: urlRequest)
-            } catch let error as URLError where Self.isWorthRetrying(error) {
-                lastError = error
-                guard attempt < attempts else { break }
-            }
-        }
-        throw lastError ?? URLError(.unknown)
-    }
-
     /// A refusal is about this caller, so every speculative lookup stands down for the
     /// same window the per-song block uses. Playback still asks when the user asks, but
     /// the prefetch stays quiet instead of turning one refusal into a probe per song.
     private func noteRiskRefusal() {
         riskControlQuietUntil = Date().addingTimeInterval(Self.riskControlQuietDuration)
-    }
-
-    /// A freshly parsed tree that nothing mutates afterwards, carried back from the parsing thread.
-    private struct ParsedObject: @unchecked Sendable {
-        let value: [String: Any]?
-    }
-
-    /// A 200-song playlist page is several hundred kilobytes of JSON. Parsing it on
-    /// the main actor held the UI for every page of every playlist walk.
-    private static func parseObject(_ data: Data) async throws -> [String: Any]? {
-        try await Task.detached(priority: Task.currentPriority) {
-            ParsedObject(value: try JSONSerialization.jsonObject(with: data) as? [String: Any])
-        }.value.value
     }
 
     private static func identifier(_ value: Any?) -> String? {

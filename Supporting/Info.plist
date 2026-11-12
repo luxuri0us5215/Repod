@@ -21,14 +21,12 @@
 			</array>
 		</dict>
 	</array>
-	<key>SpotifyClientID</key>
-	<string>$(SPOTIFY_CLIENT_ID)</string>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>spotify</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>连接你在设置中填写的网易云服务，用于搜索、扫码登录和在线播放。</string>
+	<string>直连模式不需要本地网络；自建网关模式下用于连接你填写的网易云服务。</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
@@ -38,6 +36,10 @@
 	<dict>
 		<key>UIColorName</key>
 		<string>LaunchBackground</string>
+		<key>UIImageName</key>
+		<string>LaunchMark</string>
+		<key>UIImageRespectsSafeAreaInsets</key>
+		<false/>
 	</dict>
 </dict>
 </plist>

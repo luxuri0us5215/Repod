@@ -13,8 +13,9 @@ Thanks for your interest in Repod! / 感谢关注 Repod！
 1. Fork, then create a branch from `main`.
 2. Copy `Config/Secrets.example.xcconfig` to `Config/Secrets.xcconfig` for your own Team / Bundle ID (this file is git-ignored — never commit it).
 3. Keep changes focused; match the existing SwiftUI style; build with zero warnings (`xcodebuild … -destination 'generic/platform=iOS'`).
-4. Add a short entry to `CHANGELOG.md` describing the user-visible change.
-5. Do not add hard-coded server addresses, API keys, or personal identifiers. The app must keep working with an empty NetEase address and an empty Spotify Client ID.
+4. Add a short entry to `CHANGELOG.md` describing the user-visible change (the file is Chinese; match the existing style).
+5. Do not add hard-coded server addresses, API keys, tokens, cookies or personal identifiers (team IDs, bundle IDs, device IDs). The app must keep working with no gateway address, no Spotify Client ID and no embedded credentials: direct mode, QR login and a Client ID typed in Settings are the supported paths.
+6. Run the unit tests (`xcodebuild test -project iPodPlayer.xcodeproj -scheme iPodPlayer -destination 'platform=iOS Simulator,name=iPhone 17 Pro'`) before opening the PR.
 
 ## 中文简述
 

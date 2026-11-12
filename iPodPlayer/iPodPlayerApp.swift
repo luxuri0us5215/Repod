@@ -6,13 +6,16 @@ struct iPodPlayerApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
-        // Optional build-time default (Config/*.xcconfig -> Info.plist SpotifyClientID).
-        // Registered defaults never override a value the user entered in Settings.
-        let clientID = (Bundle.main.object(forInfoDictionaryKey: "SpotifyClientID") as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !clientID.isEmpty, !clientID.hasPrefix("$(") {
-            UserDefaults.standard.register(defaults: ["spotifyClientID": clientID])
+        #if DEBUG
+        // Screenshot aid: lets a simulator launch pick a theme through the
+        // environment instead of walking 设置 -> 外观 with taps simctl cannot do.
+        if let theme = ProcessInfo.processInfo.environment["REPOD_THEME_OVERRIDE"] {
+            let defaults = UserDefaults.standard
+            defaults.set(false, forKey: "appearanceFollowSystem")
+            defaults.set(theme, forKey: "appearanceTheme")
+            defaults.set(theme, forKey: "appearanceEffectiveTheme")
         }
+        #endif
     }
 
     var body: some Scene {

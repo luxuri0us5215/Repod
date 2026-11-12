@@ -25,6 +25,12 @@ final class StreamingPlayer: ObservableObject {
     /// audio-session calls on the main thread at the exact moment the transition ran.
     private var isSessionConfigured = false
     private var isSessionActive = false
+    /// 3.1.12: `setActive` can block for a long time (Xcode's "AVAudioSession Hang
+    /// Risk"), so activation and deactivation run here, off the main thread. One
+    /// serial queue keeps a stop's deactivation ahead of the next start's activation.
+    private nonisolated static let sessionQueue = DispatchQueue(
+        label: "com.qiuhaoyu.ipodplayer.audio-session", qos: .userInitiated
+    )
 
     init() {
         timeObserver = player.addPeriodicTimeObserver(
@@ -106,17 +112,28 @@ final class StreamingPlayer: ObservableObject {
     }
 
     /// The category is set once per process; activation only when the session is not
-    /// already ours. Both calls are cheap-ish but land on the main thread, and a track
-    /// change does not need either of them.
+    /// already ours. A track change needs neither.
+    ///
+    /// The category stays synchronous: it is set once, and it must be in place before
+    /// the first `play()` so the song keeps playing in the background and through the
+    /// silent switch. Activation is queued off the main thread; AVPlayer can start
+    /// meanwhile, and a failed activation is simply retried on the next start.
     private func activateSessionIfNeeded() throws {
-        let session = AVAudioSession.sharedInstance()
         if !isSessionConfigured {
-            try session.setCategory(.playback, mode: .default)
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
             isSessionConfigured = true
         }
-        if !isSessionActive {
-            try session.setActive(true)
-            isSessionActive = true
+        guard !isSessionActive else { return }
+        isSessionActive = true
+        // A strong capture (the player is main-actor isolated, so it is Sendable)
+        // avoids a captured `weak var` in concurrent code; it lives only until
+        // activation returns.
+        Self.sessionQueue.async { [self] in
+            do {
+                try AVAudioSession.sharedInstance().setActive(true)
+            } catch {
+                Task { @MainActor in self.isSessionActive = false }
+            }
         }
     }
 
@@ -238,11 +255,11 @@ final class StreamingPlayer: ObservableObject {
         // Only deactivate the audio session on a true stop (queue end / give up),
         // not on a track change where playback resumes immediately.
         if deactivateSession, hadItem {
-            do {
-                try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-                isSessionActive = false
-            } catch {
-                // Still ours as far as this player is concerned; the next start retries.
+            // Off the main thread for the same reason as activation. Marked inactive
+            // now, so the next start queues its activation behind this one.
+            isSessionActive = false
+            Self.sessionQueue.async {
+                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
             }
         }
     }

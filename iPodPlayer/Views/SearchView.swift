@@ -11,7 +11,7 @@ struct SearchView: View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
                 TextField("输入歌曲或艺人", text: $viewModel.searchQuery,
-                          prompt: Text("输入歌曲或艺人").foregroundStyle(inputSelected ? Color.black : appearance.theme.lcdSecondaryText))
+                          prompt: Text("输入歌曲或艺人").foregroundStyle(inputSelected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText))
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .submitLabel(.search)
@@ -25,7 +25,7 @@ struct SearchView: View {
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 16))
-                            .foregroundStyle(inputSelected ? Color.black : appearance.theme.lcdSecondaryText)
+                            .foregroundStyle(inputSelected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText)
                             // A 16pt glyph was the whole hit target; this pads it
                             // out to the row's full height.
                             .padding(.vertical, 12)
@@ -47,7 +47,7 @@ struct SearchView: View {
                 .animation(.easeOut(duration: 0.15), value: viewModel.isSearching)
             }
             .font(AppFont.title)
-            .foregroundStyle(inputSelected ? Color.black : appearance.theme.lcdText)
+            .foregroundStyle(inputSelected ? appearance.theme.selectionInk : appearance.theme.lcdText)
             .padding(.horizontal, Metrics.horizontalInset)
             .frame(height: Metrics.singleLineRowHeight)
             .lcdSelectionBackground(inputSelected)
@@ -73,6 +73,7 @@ struct SearchView: View {
                           onRetryLoadMore: {
                               viewModel.retryLoadMoreSearchResults()
                           }) { index in
+                LCDKeyboard.dismiss()
                 queryFocused = false
                 viewModel.playSearchResult(at: index)
             }
@@ -97,11 +98,26 @@ struct SearchView: View {
         // The keyboard covers those rows (and most of the wheel), so it goes away
         // as soon as the selection leaves the input row.
         .onChange(of: viewModel.selectedIndex) { _, index in
-            if index >= 0, queryFocused { queryFocused = false }
+            if index >= 0, queryFocused {
+                LCDKeyboard.dismiss()
+                queryFocused = false
+            }
+        }
+        // A search started from the wheel's centre key (retry after a failure)
+        // does not come through `search()`, so the keyboard goes away here too.
+        .onChange(of: viewModel.isSearching) { _, searching in
+            if searching, queryFocused {
+                LCDKeyboard.dismiss()
+                queryFocused = false
+            }
         }
     }
 
+    /// 3.1.5: the keyboard starts down first, in this run-loop turn, and only then
+    /// does the search rebuild the result list. Setting the focus state alone let
+    /// the keyboard wait for that rebuild.
     private func search() {
+        LCDKeyboard.dismiss()
         queryFocused = false
         viewModel.performSearch()
     }
@@ -174,28 +190,35 @@ struct TrackRowsView: View {
                             .padding(10)
                     }
                 }
+                // 3.1.5: one lens for the whole list, in the scroll content.
+                .lcdLensHost()
             }
             .scrollIndicators(.hidden)
             .lcdEdgeFade(appearance.theme.lcdBackground)
-            .scrollDismissesKeyboard(.interactively)
+            .modifier(LCDFastScrollIndex(selectedIndex: selectedIndex, count: tracks.count) { index in
+                tracks.indices.contains(index) ? LCDFastScrollIndex.indexLetter(tracks[index].title) : nil
+            })
+            // Dragging the results puts the keyboard away at once instead of
+            // dragging it down with the finger.
+            .scrollDismissesKeyboard(.immediately)
             .onChange(of: selectedIndex) { oldIndex, _ in
-                scrollToSelection(proxy, leavingInput: oldIndex < 0)
+                scrollToSelection(proxy, leavingInput: oldIndex < 0, animated: true)
             }
             .onAppear { scrollToSelection(proxy, leavingInput: false) }
         }
     }
 
-    private func scrollToSelection(_ proxy: ScrollViewProxy, leavingInput: Bool) {
+    private func scrollToSelection(_ proxy: ScrollViewProxy, leavingInput: Bool, animated: Bool = false) {
         guard selectedIndex >= 0 else {
-            if !tracks.isEmpty { proxy.scrollTo(0, anchor: .top) }
-            else if loadMoreFailed { proxy.scrollTo(Self.loadMoreRowID, anchor: .top) }
+            if !tracks.isEmpty { proxy.lcdFollow(0, anchor: .top, animated: animated) }
+            else if loadMoreFailed { proxy.lcdFollow(Self.loadMoreRowID, anchor: .top, animated: animated) }
             return
         }
         if tracks.indices.contains(selectedIndex) {
             // Entering the list from the input scrolls minimally; wheel steps inside the list keep the selection centred.
-            proxy.scrollTo(selectedIndex, anchor: leavingInput ? nil : .center)
+            proxy.lcdFollow(selectedIndex, anchor: leavingInput ? nil : .center, animated: animated)
         } else if loadMoreFailed, selectedIndex == tracks.count {
-            proxy.scrollTo(Self.loadMoreRowID, anchor: .center)
+            proxy.lcdFollow(Self.loadMoreRowID, anchor: .center, animated: animated)
         }
     }
 
@@ -252,7 +275,7 @@ struct TrackRowsView: View {
                     if let subtitle {
                         Text(verbatim: subtitle)
                             .font(AppFont.detail)
-                            .foregroundStyle(selected ? Color.black : appearance.theme.lcdSecondaryText)
+                            .foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText)
                     }
                 }
                 .lineLimit(1)
@@ -261,14 +284,14 @@ struct TrackRowsView: View {
                 if showsChevron {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 14, weight: .bold))
-                        .foregroundStyle(selected ? Color.black : appearance.theme.lcdSecondaryText)
+                        .foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText)
                 }
             }
             .padding(.horizontal, Metrics.horizontalInset)
             // Same rule as the menus: a second line makes the row 60pt.
             .frame(height: subtitle == nil ? Metrics.singleLineRowHeight : Metrics.doubleLineRowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .foregroundStyle(selected ? Color.black : appearance.theme.lcdText)
+            .foregroundStyle(selected ? appearance.theme.selectionInk : appearance.theme.lcdText)
             .lcdSelectionBackground(selected)
             .contentShape(Rectangle())
         }

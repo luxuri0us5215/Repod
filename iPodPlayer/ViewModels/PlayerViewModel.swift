@@ -120,6 +120,7 @@ final class PlayerViewModel {
         }
     }
     private(set) var neteaseLoginStatus = "尚未登录；会员歌曲需要扫码登录"
+    private(set) var neteaseMode: NetEaseConnectionMode = .direct
     private(set) var neteaseQRImage: UIImage?
     private(set) var isNetEaseLoggingIn = false {
         didSet {
@@ -230,6 +231,7 @@ final class PlayerViewModel {
     @ObservationIgnored private var playbackGeneration = UUID()
     @ObservationIgnored private var qrGeneration = UUID()
     @ObservationIgnored private var configuredNetEaseURL: String
+    @ObservationIgnored private var configuredNetEaseMode: NetEaseConnectionMode
     @ObservationIgnored private var likeGeneration = UUID()
     @ObservationIgnored private var likedCheckTokens: [String: UUID] = [:]
     @ObservationIgnored private var pendingLikeToggles = Set<String>()
@@ -325,8 +327,13 @@ final class PlayerViewModel {
         L10n.install()
         selectedSource = AudioSource(rawValue: UserDefaults.standard.string(forKey: "selectedSource") ?? "") ?? .netease
         let address = UserDefaults.standard.string(forKey: "neteaseBaseURL") ?? ""
+        let storedMode = UserDefaults.standard.string(forKey: "neteaseConnectionMode")
+        let mode = NetEaseConnectionMode.resolved(storedRaw: storedMode, address: address)
+        neteaseMode = mode
+        configuredNetEaseMode = mode
         configuredNetEaseURL = address
-        netease = NetEaseClient(baseURL: address)
+        UserDefaults.standard.set(mode.rawValue, forKey: "neteaseConnectionMode")
+        netease = NetEaseClient(mode: mode, baseURL: address)
         localLibrary.onSaveFailure = { [weak self] in
             self?.alertMessage = "本地曲库保存失败，请检查设备存储空间。"
         }
@@ -342,6 +349,13 @@ final class PlayerViewModel {
             .sink { [weak self] _ in self?.flushPlaybackState() }
             .store(in: &subscriptions)
         restoreNetEaseLogin()
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-repod-open-netease-settings") {
+            DispatchQueue.main.async { [weak self] in
+                self?.open(.neteaseSettings)
+            }
+        }
+        #endif
     }
 
     /// False while the saved library index is still being read. The boot screen
@@ -421,7 +435,106 @@ final class PlayerViewModel {
         // rewrite is a multi-megabyte encode and is not needed by the first frame,
         // so it runs after the cover lifts rather than competing with it.
         localLibrary.writeDeferredCleanup()
+        #if DEBUG
+        applyScreenshotFixtureIfRequested()
+        #endif
     }
+
+    #if DEBUG
+    /// Screenshot aid for appearance reviews: `SIMCTL_CHILD_REPOD_SCREEN_OVERRIDE=nowPlaying`
+    /// opens Now Playing with a fixture track and a locally served cover, so the screen can be
+    /// inspected without driving the click wheel (simctl has no touch input). Debug builds only.
+    #if DEBUG
+    /// Albums injected for Cover Flow screenshots: the simulator has no library to browse.
+    private var coverFlowFixtureAlbums: [CoverFlowAlbum]?
+    #endif
+
+    func applyScreenshotFixtureIfRequested() {
+        let env = ProcessInfo.processInfo.environment
+        guard let requested = env["REPOD_SCREEN_OVERRIDE"], !requested.isEmpty else { return }
+        func fixture(_ key: String, _ fallback: String) -> String {
+            guard let value = env[key], !value.isEmpty else { return fallback }
+            return value
+        }
+        let home = NavigationFrame(screen: .home, selectedIndex: 0)
+        switch requested {
+        case "nowPlaying":
+            isRestoringPlayback = true
+            if env["REPOD_FIXTURE_TRACK"] == "empty" {
+                currentTrack = nil
+            } else {
+                currentTrack = Track(
+                    id: "screenshot-now-playing",
+                    title: fixture("REPOD_FIXTURE_TITLE", "Midnight City"),
+                    artist: fixture("REPOD_FIXTURE_ARTIST", "M83"),
+                    album: fixture("REPOD_FIXTURE_ALBUM", "Hurry Up, We're Dreaming"),
+                    duration: 244,
+                    source: .netease,
+                    artworkURL: URL(string: fixture("REPOD_FIXTURE_COVER", "http://127.0.0.1:8765/cover.png"))
+                )
+            }
+            isRestoringPlayback = false
+            durationSeconds = 244
+            elapsedSeconds = 96
+            isPlaying = currentTrack != nil
+            if env["REPOD_FIXTURE_LIKED"] == "1", let track = currentTrack {
+                likedNetEaseTrackIDs.insert(track.id)
+            }
+            if env["REPOD_FIXTURE_VOLUME"] == "1" {
+                volumeLevel = 0.42
+                isVolumeBarVisible = true
+            }
+            navigation = [home, NavigationFrame(screen: .nowPlaying, selectedIndex: 0)]
+        case "settings":
+            navigation = [home, NavigationFrame(screen: .settings, selectedIndex: 0)]
+        case "appearance":
+            navigation = [home,
+                          NavigationFrame(screen: .settings, selectedIndex: 0),
+                          NavigationFrame(screen: .appearance, selectedIndex: 0)]
+        case "sources":
+            navigation = [home,
+                          NavigationFrame(screen: .settings, selectedIndex: 0),
+                          NavigationFrame(screen: .sources, selectedIndex: 0)]
+        case "coverflow":
+            let titles = ["Hurry Up, We're Dreaming", "Random Access Memories", "Kind of Blue",
+                          "The Dark Side of the Moon", "In Rainbows"]
+            let artists = ["M83", "Daft Punk", "Miles Davis", "Pink Floyd", "Radiohead"]
+            coverFlowFixtureAlbums = titles.enumerated().map { index, title in
+                let track = Track(id: "fixture-album-\(index)-track", title: title,
+                                  artist: artists[index], album: title, duration: 240,
+                                  source: .netease,
+                                  artworkURL: URL(string: "http://127.0.0.1:8765/cover\(index + 1).png"))
+                return CoverFlowAlbum(id: "fixture-album-\(index)", title: title,
+                                      artist: artists[index], artworkURL: track.artworkURL,
+                                      tracks: [track])
+            }
+            // The fixture bypasses the cache path that bumps the identity, so the
+            // cover view would never reconcile to the middle copy of the loop.
+            coverFlowIdentity &+= 1
+            navigation = [home, NavigationFrame(screen: .albums, selectedIndex: 0)]
+        case "music":
+            navigation = [home, NavigationFrame(screen: .music, selectedIndex: 0)]
+        case "languages":
+            navigation = [home,
+                          NavigationFrame(screen: .settings, selectedIndex: 0),
+                          NavigationFrame(screen: .languages, selectedIndex: 0)]
+        case "list":
+            let screen = AppScreen.podcastEpisodes(id: "fixture-show", name: "产品笔记")
+            let titles = ["第一集 · 把 iPod 装进手机", "第二集 · 转盘的手感", "第三集 · 液态玻璃",
+                          "第四集 · 封面流动", "第五集 · 主题的边界", "第六集 · 从 2.0 到 3.0"]
+            libraryTracks[screen] = titles.enumerated().map { index, title in
+                Track(id: "fixture-episode-\(index)", title: title, artist: "Repod 电台",
+                      album: "05 \(index + 1) 期", duration: 1_500 + Double(index) * 60,
+                      source: .netease)
+            }
+            navigation = [home,
+                          NavigationFrame(screen: .music, selectedIndex: 0),
+                          NavigationFrame(screen: screen, selectedIndex: 0)]
+        default:
+            return
+        }
+    }
+    #endif
 
     private func restoreCachedPlaylists() {
         var restored: [MusicPlaylist] = []
@@ -860,8 +973,11 @@ final class PlayerViewModel {
         case .spotify:
             return isSpotifyLoggedIn ? nil : .spotifySettings
         case .netease:
-            // Read the stored field directly: Settings applies it to the client only on disappear.
+            // Read the stored fields directly: Settings applies them to the client only on disappear.
             let address = UserDefaults.standard.string(forKey: "neteaseBaseURL") ?? ""
+            let storedMode = UserDefaults.standard.string(forKey: "neteaseConnectionMode")
+            let mode = NetEaseConnectionMode.resolved(storedRaw: storedMode, address: address)
+            guard mode == .gateway else { return nil }
             return address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .neteaseSettings : nil
         }
     }
@@ -1158,6 +1274,9 @@ final class PlayerViewModel {
     private static let coverFlowSongEntryLimit = 2_000
 
     var coverFlowAlbums: [CoverFlowAlbum] {
+        #if DEBUG
+        if let coverFlowFixtureAlbums { return coverFlowFixtureAlbums }
+        #endif
         let pageMode = currentScreen.isTrackList
         let searchMode = currentScreen == .search
         // Cache stamps only: reading browseTracks here would filter and sort the
@@ -1353,15 +1472,26 @@ final class PlayerViewModel {
                 + AppThemePreset.allCases.map { MenuEntry($0.rawValue, action: .setting(.theme($0))) }
                 + [
                     MenuEntry("使用自定强调色", switchValue: customAccent, action: .setting(.customAccentEnabled)),
-                    MenuEntry("自定强调色", action: .setting(.customAccentColor))
+                    MenuEntry("自定强调色", action: .setting(.customAccentColor)),
+                    // 3.1, appended after the existing rows so their order is untouched.
+                    MenuEntry("沉浸式播放页",
+                              switchValue: UserDefaults.standard.bool(forKey: "immersiveNowPlaying"),
+                              action: .setting(.immersiveNowPlaying))
                 ]
         case .neteaseSettings:
             var entries = [
-                MenuEntry("网易云服务地址", action: .setting(.neteaseAddress)),
+                MenuEntry("连接方式",
+                          detail: neteaseMode == .direct ? "直连官方接口" : "自建网关",
+                          action: .setting(.neteaseMode))
+            ]
+            if neteaseMode == .gateway {
+                entries.append(MenuEntry("网易云服务地址", action: .setting(.neteaseAddress)))
+            }
+            entries.append(contentsOf: [
                 MenuEntry("保存并检查登录", action: .setting(.saveNetEase)),
                 MenuEntry(isNetEaseLoggingIn ? "重新生成二维码" : "生成登录二维码",
                           id: "neteaseQR", action: .setting(.generateNetEaseQR))
-            ]
+            ])
             if isNetEaseLoggingIn {
                 entries.append(MenuEntry("取消", action: .setting(.cancelNetEaseQR)))
             }
@@ -3342,14 +3472,35 @@ final class PlayerViewModel {
 
     func settingsChanged() {
         let address = UserDefaults.standard.string(forKey: "neteaseBaseURL") ?? ""
-        if address != configuredNetEaseURL {
+        let storedMode = UserDefaults.standard.string(forKey: "neteaseConnectionMode")
+        let mode = NetEaseConnectionMode.resolved(storedRaw: storedMode, address: address)
+        let addressChanged = address != configuredNetEaseURL
+        let modeChanged = mode != configuredNetEaseMode
+        if addressChanged || modeChanged {
             configuredNetEaseURL = address
+            configuredNetEaseMode = mode
+            neteaseMode = mode
+            UserDefaults.standard.set(mode.rawValue, forKey: "neteaseConnectionMode")
             cancelNetEaseStatusCheck()
             cancelNetEaseQRLogin()
-            netease.configure(address)
-            neteaseLoginStatus = "服务地址已更新，登录凭据已保留；请检查登录"
+            netease.configure(mode: mode, baseURL: address)
+            let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+            if mode == .gateway, trimmed.isEmpty {
+                neteaseLoginStatus = "请先到“设置 → 网易云设置”填写自建网关地址。"
+            } else if addressChanged, !modeChanged {
+                neteaseLoginStatus = "服务地址已更新，登录凭据已保留；请检查登录"
+            } else if mode == .direct {
+                neteaseLoginStatus = "已切换为直连官方接口，登录凭据已保留；请检查登录"
+            } else {
+                neteaseLoginStatus = "已切换为自建网关，登录凭据已保留；请检查登录"
+            }
         }
         spotify.configurationChanged()
+    }
+
+    func setNetEaseMode(_ mode: NetEaseConnectionMode) {
+        UserDefaults.standard.set(mode.rawValue, forKey: "neteaseConnectionMode")
+        settingsChanged()
     }
 
     private func restoreNetEaseLogin() {

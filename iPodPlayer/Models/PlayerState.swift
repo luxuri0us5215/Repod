@@ -122,7 +122,10 @@ enum AppScreen: Hashable {
 
     var title: String {
         switch self {
-        case .home: return "iPod"
+        // The device's own name is the product's, not Apple's: "Repod" is the
+        // locked name in `L10n.untranslated`, so it stays the same in every
+        // language, exactly as "MENU" does.
+        case .home: return "Repod"
         case .languages: return L10n.text("语言")
         case .music: return L10n.text("音乐")
         case .settings: return L10n.text("设置")
@@ -155,8 +158,8 @@ enum MenuAction: Equatable {
 }
 
 enum SettingsAction: Equatable {
-    case followSystem, theme(AppThemePreset), customAccentEnabled, customAccentColor
-    case neteaseAddress, saveNetEase, generateNetEaseQR, cancelNetEaseQR, logoutNetEase
+    case followSystem, theme(AppThemePreset), customAccentEnabled, customAccentColor, immersiveNowPlaying
+    case neteaseMode, neteaseAddress, saveNetEase, generateNetEaseQR, cancelNetEaseQR, logoutNetEase
     case spotifyClientID, spotifyRedirectURI, loginSpotify, logoutSpotify
 }
 
@@ -235,6 +238,8 @@ enum AppLanguage: String, CaseIterable, Identifiable {
     case english = "en"
     case traditionalChinese = "zh-Hant"
     var id: String { rawValue }
+    /// The script whose glyph forms Chinese text is drawn in (see `ContentView`).
+    var typesettingLanguage: Locale.Language { Locale.Language(identifier: rawValue) }
     var nativeName: String {
         switch self {
         case .simplifiedChinese: return "简体中文"
@@ -302,14 +307,26 @@ enum L10n {
         "关": ("Off", "關"),
         "歌曲": ("Songs", "歌曲"),
         "跟随系统": ("Follow System", "跟隨系統"),
+        "沉浸式播放页": ("Immersive Now Playing", "沉浸式播放頁"),
         "使用自定强调色": ("Use Custom Accent", "使用自訂強調色"),
         "自定强调色": ("Custom Accent", "自訂強調色"),
         "经典白": ("Classic White", "經典白"),
         "午夜黑": ("Midnight Black", "午夜黑"),
         "薄荷绿": ("Mint Green", "薄荷綠"),
         "落日橙": ("Sunset Orange", "落日橙"),
+        "银色": ("Silver", "銀色"),
         "网易云": ("NetEase", "網易雲"),
         "网易云音乐": ("NetEase Music", "網易雲音樂"),
+        "连接方式": ("Connection", "連線方式"),
+        "直连官方接口": ("Direct", "直連官方介面"),
+        "自建网关": ("Self-hosted Gateway", "自建閘道"),
+        "无需服务器，直接连接网易云": ("No server needed; connects to NetEase directly", "無需伺服器，直接連線網易雲"),
+        "使用你填写的自建服务地址": ("Uses the self-hosted service URL you enter", "使用你填寫的自建服務位址"),
+        "选择连接方式": ("Choose Connection", "選擇連線方式"),
+        "已切换为直连官方接口，登录凭据已保留；请检查登录": ("Switched to Direct. Login credentials were kept; check your login.", "已切換為直連官方介面，登入憑證已保留；請檢查登入。"),
+        "已切换为自建网关，登录凭据已保留；请检查登录": ("Switched to Self-hosted Gateway. Login credentials were kept; check your login.", "已切換為自建閘道，登入憑證已保留；請檢查登入。"),
+        "请先到“设置 → 网易云设置”填写自建网关地址。": ("Enter your self-hosted gateway URL in Settings → NetEase Settings first.", "請先到「設定 → 網易雲設定」填寫自建閘道位址。"),
+        "直连模式部分歌曲可能受地区版权限制": ("Some songs may be region-restricted in Direct mode", "直連模式部分歌曲可能受地區版權限制"),
         "网易云服务地址": ("NetEase Service URL", "網易雲服務位址"),
         "保存并检查登录": ("Save and Check Login", "儲存並檢查登入"),
         "重新生成二维码": ("Generate New QR Code", "重新產生 QR 碼"),
@@ -333,6 +350,8 @@ enum L10n {
         "正在搜索": ("Searching", "正在搜尋"),
         "正在载入": ("Loading", "正在載入"),
         "正在准备曲库…": ("Preparing your library…", "正在準備曲庫…"),
+        "滑动来解锁": ("Slide to Unlock", "滑動來解鎖"),
+        "正在解锁…": ("Unlocking…", "正在解鎖…"),
         "正在启动": ("Starting", "正在啟動"),
         "正在搜索…": ("Searching…", "正在搜尋…"),
         "正在载入…": ("Loading…", "正在載入…"),
@@ -369,7 +388,7 @@ enum L10n {
         "轻点播放这首歌曲": ("Tap to play this song", "輕點播放這首歌曲"),
         "提示": ("Notice", "提示"),
         "好": ("OK", "好"),
-        "http://your-server:3000": ("http://your-server:3000", "http://your-server:3000"),
+        "http://<云电脑 Tailscale IP>:3000": ("http://<server Tailscale IP>:3000", "http://<雲端電腦 Tailscale IP>:3000"),
         "网易云登录二维码，请用网易云音乐扫码": ("NetEase login QR code. Scan it with NetEase Music.", "網易雲登入 QR 碼，請用網易雲音樂掃碼"),
         "尚未登录；会员歌曲需要扫码登录": ("Not logged in; scan the QR code for subscription tracks", "尚未登入；會員歌曲需要掃碼登入"),
         "请在设置中登录 Spotify": ("Log in to Spotify in Settings", "請在設定中登入 Spotify"),
@@ -445,6 +464,9 @@ enum L10n {
         "服务未返回二维码地址，请稍后重试。": ("No QR code URL was returned. Try again later.", "服務未傳回 QR 碼位址，請稍後重試。"),
         "扫码已确认，但服务未返回登录凭据。请检查服务版本并重新扫码。": ("QR login was confirmed but no credentials were returned. Check the service version and scan again.", "掃碼已確認，但服務未傳回登入憑證。請檢查服務版本並重新掃碼。"),
         "无法识别扫码状态，请重新生成二维码。": ("Unrecognized QR login status. Generate a new QR code.", "無法辨識掃碼狀態，請重新產生 QR 碼。"),
+        "网易云拒绝了这次扫码登录（8821）。自建服务的扫码方式已被网易云停用，请把服务升级到 NeteaseCloudMusicApiEnhanced，或让手机能直接访问网易云后重试。": ("NetEase refused this QR login (8821). It no longer accepts the login your server uses. Upgrade the server to NeteaseCloudMusicApiEnhanced, or let the phone reach NetEase directly, then try again.", "網易雲拒絕了這次掃碼登入（8821）。自建服務的掃碼方式已被網易雲停用，請將服務升級到 NeteaseCloudMusicApiEnhanced，或讓手機能直接連到網易雲後重試。"),
+        "网易云拒绝了这次扫码登录（8821）。请稍后重新生成二维码再试。": ("NetEase refused this QR login (8821). Generate a new QR code and try again in a little while.", "網易雲拒絕了這次掃碼登入（8821）。請稍後重新產生 QR 碼再試。"),
+        "缺少二维码密钥。": ("The QR code key is missing.", "缺少 QR 碼金鑰。"),
         "请先到“设置 → 网易云设置”填写自己的服务地址。": ("Enter your service URL in Settings → NetEase Settings first.", "請先到「設定 → 網易雲設定」填寫自己的服務位址。"),
         "服务地址无效，请填写完整的网页服务地址，不要包含账号、密码或查询参数。": ("Invalid service URL. Enter the full web service URL without credentials or query parameters.", "服務位址無效，請填寫完整的網頁服務位址，且勿包含帳號、密碼或查詢參數。"),
         "服务地址无效。": ("Invalid Service URL.", "服務位址無效。"),

@@ -1,598 +1,560 @@
 import SwiftUI
 import UIKit
+import Observation
 
-/// Scroll copies share album identity and artwork; only their scroll IDs differ.
-struct CoverFlowLoop {
-    let albumCount: Int
-    let copyCount: Int
+// MARK: - Motion
 
-    init(albumCount: Int, visibleSlotCount: Int) {
-        self.albumCount = max(0, albumCount)
-        // A release can travel seven slots without rebasing the visible curve.
-        // Leave that travel plus a viewport of neighbours on either side.
-        copyCount = albumCount > 1 ? max(3, 2 * ((visibleSlotCount + 7 + albumCount - 1) / albumCount) + 3) : 1
+/// Fires a display link without the link retaining the motion model.
+@MainActor
+private final class CoverFlowFrameTarget: NSObject {
+    var onFrame: ((CADisplayLink) -> Void)?
+    @objc func frame(_ link: CADisplayLink) { onFrame?(link) }
+}
+
+/// Cover Flow's position, as a fractional cover index ("slot").
+///
+/// 3.1.6 rewrite. The old flow lived inside a `ScrollView` + `LazyHStack` with a
+/// UIKit probe that moved the scroll view's bounds behind SwiftUI's back. Two
+/// bugs came out of that: the probe reported slot 0 (the scroll view's initial
+/// offset) before the deferred centring landed, which replaced the playing song
+/// as the remembered selection; and the lazy stack never built the slots left of
+/// a programmatic jump until a real drag scrolled them in.
+///
+/// Now there is no scroll view. A drag writes `position` directly; a release, a
+/// tap or a step hands it to an exactly integrated, critically damped spring on
+/// a display link. The value on screen is always the value here, so a cover can
+/// be caught mid-glide without a jump, and every visible cover is laid out from
+/// `position` on every frame — none waits to be loaded in.
+@MainActor
+@Observable
+final class CoverFlowMotion {
+    /// Shorter lists stop at both ends (with a rubber band) instead of looping,
+    /// so the same cover never appears twice on screen.
+    nonisolated static let loopThreshold = 16
+
+    nonisolated static func loops(count: Int) -> Bool { count >= loopThreshold }
+
+    nonisolated static func albumIndex(for slot: Int, count: Int) -> Int {
+        guard count > 0 else { return 0 }
+        if loops(count: count) { return (slot % count + count) % count }
+        return min(max(slot, 0), count - 1)
     }
 
-    var slotCount: Int { albumCount * copyCount }
+    /// Fractional slot. Unbounded while looping.
+    private(set) var position: Double = 0
+    /// `position` rounded. Published only when it changes, so views that need
+    /// just the centred cover do not redraw on every frame.
+    private(set) var centeredIndex = 0
 
-    func albumIndex(for slot: Int) -> Int {
-        guard albumCount > 0 else { return 0 }
-        return (slot % albumCount + albumCount) % albumCount
+    @ObservationIgnored private(set) var count = 0
+    @ObservationIgnored private(set) var isDragging = false
+    @ObservationIgnored private var velocity: Double = 0
+    @ObservationIgnored private var target: Double?
+    @ObservationIgnored private var dragOrigin: Double = 0
+    @ObservationIgnored private var dragBaseline: Double = 0
+    @ObservationIgnored private var link: CADisplayLink?
+    @ObservationIgnored private var frameTarget: CoverFlowFrameTarget?
+    @ObservationIgnored private var lastFrame: CFTimeInterval?
+
+    /// Spring stiffness (natural frequency, rad/s): a one-cover step settles in about 0.45 s.
+    private let omega: Double = 11
+
+    var loops: Bool { Self.loops(count: count) }
+    var isSettled: Bool { target == nil && !isDragging }
+
+    func configure(count: Int) {
+        self.count = count
     }
 
-    func realSlot(for slot: Int) -> Int {
-        (copyCount / 2) * albumCount + albumIndex(for: slot)
+    func albumIndex(for slot: Int) -> Int { Self.albumIndex(for: slot, count: count) }
+
+    /// The slot showing `albumIndex` that is closest to where the flow is now.
+    func nearestSlot(for albumIndex: Int) -> Int {
+        guard loops, count > 0 else { return albumIndex }
+        let turns = ((position - Double(albumIndex)) / Double(count)).rounded()
+        return albumIndex + Int(turns) * count
     }
 
-    func steppedSlot(from slot: Int, direction: Int) -> Int {
-        realSlot(for: slot + direction)
+    func jump(to slot: Int) {
+        stop()
+        isDragging = false
+        set(Double(slot))
+    }
+
+    // MARK: Drag
+
+    func beginDrag(at slots: Double) {
+        stop()
+        isDragging = true
+        dragOrigin = position
+        dragBaseline = slots
+    }
+
+    func drag(to slots: Double) {
+        guard isDragging else { return }
+        var raw = dragOrigin + (slots - dragBaseline)
+        if !loops { raw = rubberBand(raw) }
+        set(raw)
+    }
+
+    /// `v` is in slots per second.
+    func endDrag(velocity v: Double) {
+        guard isDragging else { return }
+        isDragging = false
+        var goal = (position + max(-9, min(9, v * 0.32))).rounded()
+        if abs(v) > 1.2 {
+            // A deliberate flick always reaches at least the next cover in its direction.
+            goal = v > 0 ? max(goal, position.rounded(.down) + 1)
+                         : min(goal, position.rounded(.up) - 1)
+        }
+        glide(to: goal, velocity: v)
+    }
+
+    // MARK: Glide
+
+    func step(_ delta: Int) {
+        guard !isDragging else { return }
+        glide(to: (target ?? position.rounded()) + Double(delta))
+    }
+
+    /// Without a velocity, the current one carries over, so retargeting a
+    /// moving flow (a tap or a step mid-glide) never stalls it.
+    func glide(to slot: Double, velocity v: Double? = nil) {
+        var goal = slot.rounded()
+        if !loops { goal = min(max(goal, 0), Double(max(count - 1, 0))) }
+        target = goal
+        let v = v ?? velocity
+        let distance = goal - position
+        // A critically damped spring passes its goal only if it sets off toward
+        // it faster than omega × distance; hand over just under that.
+        let limit = omega * abs(distance) * 0.9
+        velocity = v * distance > 0 ? max(-limit, min(limit, v)) : 0
+        startLink()
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+        frameTarget = nil
+        target = nil
+        velocity = 0
+        lastFrame = nil
+    }
+
+    private func startLink() {
+        guard link == nil else { return }
+        let proxy = CoverFlowFrameTarget()
+        proxy.onFrame = { [weak self] link in self?.advance(link) }
+        let link = CADisplayLink(target: proxy, selector: #selector(CoverFlowFrameTarget.frame(_:)))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+        link.add(to: .main, forMode: .common)
+        self.link = link
+        frameTarget = proxy
+        lastFrame = nil
+    }
+
+    private func advance(_ link: CADisplayLink) {
+        guard let goal = target else { stop(); return }
+        let now = link.targetTimestamp
+        let dt = lastFrame.map { min(max(now - $0, 0), 1.0 / 20) } ?? link.duration
+        lastFrame = now
+        // Exact critically damped solution over dt: stable at any frame rate.
+        let x0 = position - goal
+        let v0 = velocity
+        let decay = exp(-omega * dt)
+        let x = (x0 + (v0 + omega * x0) * dt) * decay
+        let v = (v0 - omega * (v0 + omega * x0) * dt) * decay
+        if abs(x) < 0.0008, abs(v) < 0.02 {
+            stop()
+            set(goal)
+            return
+        }
+        velocity = v
+        set(goal + x)
+    }
+
+    private func set(_ value: Double) {
+        position = value
+        var slot = Int(value.rounded())
+        if !loops { slot = min(max(slot, 0), max(count - 1, 0)) }
+        if slot != centeredIndex { centeredIndex = slot }
+    }
+
+    /// Past either end of a short list the flow gives way less and less, up to
+    /// just over half a cover.
+    private func rubberBand(_ raw: Double) -> Double {
+        let upper = Double(max(count - 1, 0))
+        func resist(_ overshoot: Double) -> Double { 0.55 * overshoot / (1 + overshoot) }
+        if raw < 0 { return -resist(-raw) }
+        if raw > upper { return upper + resist(raw - upper) }
+        return raw
     }
 }
 
-private struct CoverFlowSlotAnchors: PreferenceKey {
-    static var defaultValue: [Int: Anchor<CGRect>] = [:]
-    static func reduce(value: inout [Int: Anchor<CGRect>], nextValue: () -> [Int: Anchor<CGRect>]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+// MARK: - Layout
+
+/// The classic Cover Flow stage: a flat cover in the middle, and stacks of covers
+/// turned toward it on either side, all standing on one mirrored floor.
+struct CoverFlowMetrics {
+    static let panelHeight: CGFloat = 54
+    static let spacing: CGFloat = 16
+    /// How far the side covers are turned toward the centre.
+    static let sideAngle: Double = 64
+
+    let side: CGFloat
+    let reflection: CGFloat
+    /// Centre of the centre cover to centre of the first cover in either stack.
+    let centerGap: CGFloat
+    /// Spacing within a side stack.
+    let sidePitch: CGFloat
+    /// Finger travel that moves the flow by one cover.
+    let dragPitch: CGFloat
+    let halfWidth: CGFloat
+    let topInset: CGFloat
+    let bottomInset: CGFloat
+    let sideInset: CGFloat
+
+    init(size: CGSize, insets: EdgeInsets) {
+        topInset = max(insets.top, 10)
+        bottomInset = max(insets.bottom, 10)
+        sideInset = max(20, insets.leading, insets.trailing)
+        let available = size.height - topInset - bottomInset - Self.panelHeight - Self.spacing
+        side = max(96, min(240, available / 1.30, size.width * 0.34)).rounded()
+        reflection = (side * 0.28).rounded()
+        centerGap = side * 0.80
+        sidePitch = side * 0.25
+        dragPitch = side * 0.55
+        halfWidth = size.width / 2
+    }
+
+    var stageHeight: CGFloat { side + 2 + reflection }
+
+    /// Where a cover meets its reflection, as a unit point of the cover view.
+    /// Side covers shrink toward it, so every cover stands on the same floor.
+    var floorAnchor: UnitPoint { UnitPoint(x: 0.5, y: side / stageHeight) }
+
+    /// Every slot that can be on screen around `position`, plus one either side.
+    func visibleSlots(around position: Double, count: Int) -> [Int] {
+        guard count > 0 else { return [] }
+        let reach = Int(ceil(max(0, halfWidth - centerGap) / sidePitch)) + 2
+        let centre = Int(position.rounded())
+        var low = centre - reach
+        var high = centre + reach
+        if !CoverFlowMotion.loops(count: count) {
+            low = max(low, 0)
+            high = min(high, count - 1)
+        }
+        guard low <= high else { return [] }
+        return Array(low...high)
     }
 }
 
-/// Keep native dragging; own release momentum, exact settling and centre reporting.
-private struct CoverFlowScrollProbe: UIViewRepresentable {
-    @MainActor final class State: NSObject, UIScrollViewDelegate {
-        weak var view: UIView?
-        private weak var observedScrollView: UIScrollView?
-        private weak var downstreamDelegate: UIScrollViewDelegate?
-        private var offsetObservation: NSKeyValueObservation?
-        private var displayLink: CADisplayLink?
-        private var loop = CoverFlowLoop(albumCount: 0, visibleSlotCount: 0)
-        private var slotPitch: CGFloat = 1
-        private var slotWidth: CGFloat = 1
-        private var isRebasing = false
-        private var pendingReleaseVelocity: CGFloat?
-        private var settledSlot: Int?
-        private var glide: Glide?
-        private var trackingStartedAt: CFTimeInterval?
-        private var pendingSlot: Int?
-        private var lastReportedSlot: Int?
-        var onCenteredSlot: ((Int) -> Void)?
+/// Places one cover from its distance to the centre (in slots).
+private struct CoverFlowPlacement: ViewModifier {
+    let distance: Double
+    let metrics: CoverFlowMetrics
 
-        private struct Glide {
-            var startX: CGFloat
-            var destinationX: CGFloat
-            var destinationSlot: Int
-            let velocity: CGFloat
-            var startedAt: CFTimeInterval
-            let duration: CFTimeInterval
-        }
+    func body(content: Content) -> some View {
+        let magnitude = abs(distance)
+        let turn = min(magnitude, 1)               // 0 at the centre, 1 in a stack
+        let sign: Double = distance < 0 ? -1 : 1
+        let x = magnitude < 1
+            ? distance * Double(metrics.centerGap)
+            : sign * (Double(metrics.centerGap) + (magnitude - 1) * Double(metrics.sidePitch))
+        // Deeper into a stack, a little darker: depth without fog.
+        let dim = 0.30 * turn + min(0.22, max(0, magnitude - 1) * 0.05)
+        content
+            .brightness(-dim)
+            .scaleEffect(CGFloat(1 - 0.12 * turn), anchor: metrics.floorAnchor)
+            .rotation3DEffect(.degrees(-sign * turn * CoverFlowMetrics.sideAngle),
+                              axis: (x: 0, y: 1, z: 0), perspective: 0.5)
+            .offset(x: CGFloat(x))
+    }
+}
 
-        var scrollView: UIScrollView? {
-            var ancestor = view?.superview
-            while let current = ancestor {
-                if let scrollView = current as? UIScrollView { return scrollView }
-                ancestor = current.superview
-            }
-            return nil
-        }
+// MARK: - Covers
 
-        func configure(view: UIView, loop: CoverFlowLoop, slotPitch: CGFloat, slotWidth: CGFloat) {
-            if self.loop.slotCount != loop.slotCount || self.slotPitch != slotPitch { cancelMotion() }
-            self.view = view
-            self.loop = loop
-            self.slotPitch = slotPitch
-            self.slotWidth = slotWidth
-            connect()
-        }
+private struct CoverFlowCover: View {
+    let album: CoverFlowAlbum
+    let metrics: CoverFlowMetrics
 
-        func center(on slot: Int) {
-            cancelMotion()
-            pendingSlot = slot
-            applyPendingCenter()
-        }
-
-        private func applyPendingCenter() {
-            guard let slot = pendingSlot, let scrollView = observedScrollView,
-                  !scrollView.isTracking, !scrollView.isDragging,
-                  let firstCenter = firstSlotCenter(in: scrollView),
-                  scrollView.contentSize.width >= CGFloat(loop.slotCount) * slotPitch - 5 else { return }
-            let targetX = firstCenter + CGFloat(slot) * slotPitch - scrollView.bounds.width / 2
-            pendingSlot = nil
-            stopNativeDeceleration(in: scrollView)
-            settledSlot = slot
-            scrollView.setContentOffset(CGPoint(x: targetX, y: scrollView.contentOffset.y), animated: false)
-            rebase()
-            reportCenteredSlot()
-        }
-
-        private func reportCenteredSlot() {
-            guard let scrollView = observedScrollView, let firstCenter = firstSlotCenter(in: scrollView),
-                  loop.slotCount > 0 else { return }
-            let slot = min(max(Int(((scrollView.contentOffset.x + scrollView.bounds.width / 2 - firstCenter)
-                                    / slotPitch).rounded()), 0), loop.slotCount - 1)
-            guard lastReportedSlot != slot else { return }
-            lastReportedSlot = slot
-            // Selection is read-only: SwiftUI never writes a competing scroll target.
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.lastReportedSlot == slot else { return }
-                self.onCenteredSlot?(slot)
+    var body: some View {
+        CachedArtwork(url: album.artworkURL) { image in
+            VStack(spacing: 2) {
+                face(image)
+                // The same decoded image, mirrored; the reflection never loads a URL.
+                face(image)
+                    .scaleEffect(x: 1, y: -1)
+                    .frame(height: metrics.reflection, alignment: .top)
+                    .clipped()
+                    .mask(LinearGradient(colors: [.black.opacity(0.36), .black.opacity(0)],
+                                         startPoint: .top, endPoint: .bottom))
+                    .accessibilityHidden(true)
             }
         }
+        .frame(width: metrics.side, height: metrics.stageHeight)
+    }
 
-        func connect() {
-            guard let scrollView else { return }
-            // Native dragging remains intact; release momentum belongs to the custom glide.
-            scrollView.decelerationRate = UIScrollView.DecelerationRate(rawValue: 0.99)
-            guard observedScrollView !== scrollView else {
-                installDelegate(on: scrollView)
-                applyPendingCenter()
-                return
-            }
-            disconnect()
-            observedScrollView = scrollView
-            installDelegate(on: scrollView)
-            scrollView.panGestureRecognizer.addTarget(self, action: #selector(panChanged(_:)))
-            offsetObservation = scrollView.observe(\.contentOffset, options: [.new]) { [weak self] _, _ in
-                MainActor.assumeIsolated {
-                    guard let self else { return }
-                    // Only a native drag rebases here. The glide owns every release frame,
-                    // including the final one; no observer corrects its resting offset later.
-                    if self.observedScrollView?.isDragging == true { self.rebase() }
-                    self.reportCenteredSlot()
+    private func face(_ image: Image?) -> some View {
+        let shape = RoundedRectangle(cornerRadius: Metrics.artworkRadius, style: .continuous)
+        return Group {
+            if let image {
+                image.resizable().scaledToFill()
+            } else {
+                ZStack {
+                    LinearGradient(colors: [Color(white: 0.17), Color(white: 0.09)],
+                                   startPoint: .top, endPoint: .bottom)
+                    Image(systemName: "music.note")
+                        .font(.system(size: metrics.side * 0.2, weight: .light))
+                        .foregroundStyle(Color(white: 0.62))
                 }
             }
-            applyPendingCenter()
         }
-
-        private func installDelegate(on scrollView: UIScrollView) {
-            guard scrollView.delegate !== self else { return }
-            downstreamDelegate = scrollView.delegate
-            scrollView.delegate = self
-        }
-
-        nonisolated override func responds(to selector: Selector!) -> Bool {
-            if super.responds(to: selector) { return true }
-            return MainActor.assumeIsolated { downstreamDelegate?.responds(to: selector) ?? false }
-        }
-
-        nonisolated override func forwardingTarget(for selector: Selector!) -> Any? {
-            var target: Any?
-            MainActor.assumeIsolated {
-                if let downstreamDelegate, downstreamDelegate.responds(to: selector) {
-                    target = downstreamDelegate
-                }
-            }
-            return target ?? super.forwardingTarget(for: selector)
-        }
-
-        func scrollViewWillEndDragging(_ scrollView: UIScrollView, withVelocity velocity: CGPoint,
-                                       targetContentOffset: UnsafeMutablePointer<CGPoint>) {
-            downstreamDelegate?.scrollViewWillEndDragging?(scrollView, withVelocity: velocity,
-                                                           targetContentOffset: targetContentOffset)
-            // Prevent UIKit from scheduling its own journey after release. Its target is
-            // the release position; the display link alone carries the cover to its slot.
-            targetContentOffset.pointee = scrollView.contentOffset
-        }
-
-        func cancelMotion() {
-            pendingReleaseVelocity = nil
-            settledSlot = nil
-            stopGlide()
-        }
-
-        func disconnect() {
-            cancelMotion()
-            observedScrollView?.panGestureRecognizer.removeTarget(self, action: #selector(panChanged(_:)))
-            if let scrollView = observedScrollView, scrollView.delegate === self {
-                scrollView.delegate = downstreamDelegate
-            }
-            downstreamDelegate = nil
-            offsetObservation?.invalidate()
-            offsetObservation = nil
-            observedScrollView = nil
-        }
-
-        @objc private func panChanged(_ pan: UIPanGestureRecognizer) {
-            guard let scrollView = observedScrollView else { return }
-            switch pan.state {
-            case .began:
-                pendingSlot = nil
-                pendingReleaseVelocity = nil
-                settledSlot = nil
-                stopGlide()
-            case .ended, .cancelled:
-                pendingReleaseVelocity = pan.state == .ended ? -pan.velocity(in: scrollView).x : 0
-                settledSlot = nil
-                // UIKit can still report dragging/tracking on the next run-loop turn.
-                // Keep the release pending until a display-link frame sees the drag fully ended.
-                startDisplayLink()
-            default: break
-            }
-        }
-
-        private func firstSlotCenter(in scrollView: UIScrollView) -> CGFloat? {
-            guard let view, view.window != nil, scrollView.bounds.width > 0 else { return nil }
-            return view.convert(CGPoint(x: slotWidth / 2, y: 0), to: scrollView).x
-        }
-
-        func step(direction: Int) -> Bool {
-            guard let scrollView = observedScrollView, !scrollView.isTracking, !scrollView.isDragging,
-                  let firstCenter = firstSlotCenter(in: scrollView) else { return false }
-            let baseX = glide?.destinationX ?? scrollView.contentOffset.x
-            let slot = Int(((baseX + scrollView.bounds.width / 2 - firstCenter) / slotPitch).rounded())
-            pendingReleaseVelocity = nil
-            startGlide(velocity: 0, in: scrollView, targetSlot: slot + direction)
-            return true
-        }
-
-        private func startGlide(velocity: CGFloat, in scrollView: UIScrollView, targetSlot: Int? = nil) {
-            stopGlide()
-            settledSlot = nil
-            guard loop.slotCount > 0, let firstCenter = firstSlotCenter(in: scrollView) else { return }
-            // Writing the same contentOffset can leave UIKit's deceleration active on device.
-            // End its scrolling transaction after release, then restore the release position.
-            stopNativeDeceleration(in: scrollView)
-            // Rebase before sampling the curve, never during or after its final frame.
-            // The loop has a viewport of spare copies plus room for the seven-slot glide.
-            let releaseX = scrollView.contentOffset.x
-            rebase()
-            let rebasedTargetSlot = targetSlot.map {
-                $0 + Int(((scrollView.contentOffset.x - releaseX) / slotPitch).rounded())
-            }
-            let startX = scrollView.contentOffset.x
-            let projection = abs(velocity) >= 2 * slotPitch
-                ? min(max(velocity * 0.38, -7 * slotPitch), 7 * slotPitch) : 0
-            var projectedSlot = Int(((startX + projection + scrollView.bounds.width / 2 - firstCenter)
-                                     / slotPitch).rounded())
-            if abs(velocity) >= 2 * slotPitch {
-                let releaseSlot = Int(((startX + scrollView.bounds.width / 2 - firstCenter) / slotPitch).rounded())
-                // A deliberate flick always carries to at least the next cover in its direction.
-                projectedSlot = velocity > 0 ? max(projectedSlot, releaseSlot + 1)
-                                             : min(projectedSlot, releaseSlot - 1)
-            }
-            let slot = min(max(rebasedTargetSlot ?? projectedSlot, 0), loop.slotCount - 1)
-            let destinationX = firstCenter + CGFloat(slot) * slotPitch - scrollView.bounds.width / 2
-            let duration = abs(velocity) >= 2 * slotPitch
-                ? 0.62 + min(0.33, Double(abs(velocity)) / 12_000) : 0.42
-            let travel = destinationX - startX
-            // A monotone Hermite curve keeps release momentum without overshooting the centred cover.
-            let launchVelocity = travel * velocity > 0
-                ? (velocity > 0 ? 1.0 : -1.0) * min(abs(velocity), 3 * abs(travel) / CGFloat(duration)) : 0
-            glide = Glide(startX: startX, destinationX: destinationX, destinationSlot: slot,
-                          velocity: launchVelocity, startedAt: CACurrentMediaTime(), duration: duration)
-            startDisplayLink()
-        }
-
-        private func stopNativeDeceleration(in scrollView: UIScrollView) {
-            let releaseOffset = scrollView.contentOffset
-            if scrollView.isScrollEnabled {
-                scrollView.isScrollEnabled = false
-                scrollView.isScrollEnabled = true
-            }
-            scrollView.setContentOffset(releaseOffset, animated: false)
-        }
-
-        private func startDisplayLink() {
-            guard displayLink == nil else { return }
-            let link = CADisplayLink(target: self, selector: #selector(advanceGlide(_:)))
-            displayLink = link
-            link.add(to: .main, forMode: .common)
-        }
-
-        @objc private func advanceGlide(_ link: CADisplayLink) {
-            guard let scrollView = observedScrollView else { stopGlide(); return }
-            // A release is never discarded merely because UIKit has not cleared isDragging yet.
-            if scrollView.isDragging { return }
-            if scrollView.isTracking {
-                // A touch that never becomes a pan must not strand a half-centred
-                // cover. Hold the curve until release; an actual pan cancels it.
-                if trackingStartedAt == nil { trackingStartedAt = link.timestamp }
-                return
-            }
-            if let trackingStartedAt {
-                glide?.startedAt += link.timestamp - trackingStartedAt
-                self.trackingStartedAt = nil
-            }
-            if let velocity = pendingReleaseVelocity {
-                pendingReleaseVelocity = nil
-                startGlide(velocity: velocity, in: scrollView)
-                return
-            }
-            guard let glide else { stopGlide(); return }
-            let t = CGFloat(min(1, max(0, (link.timestamp - glide.startedAt) / glide.duration)))
-            if t == 1 {
-                // Write the exact destination, not the last sampled curve point.
-                settledSlot = glide.destinationSlot
-                scrollView.setContentOffset(CGPoint(x: glide.destinationX, y: scrollView.contentOffset.y), animated: false)
-                stopGlide()
-                reportCenteredSlot()
-                return
-            }
-            let eased = 3 * t * t - 2 * t * t * t
-            let momentum = t * t * t - 2 * t * t + t
-            let x = glide.startX + (glide.destinationX - glide.startX) * eased
-                + glide.velocity * CGFloat(glide.duration) * momentum
-            // Gently strengthen the final pull without changing release momentum or its destination.
-            let snapPull: CGFloat = 0.12 * t * t
-            let snappedX = x + (glide.destinationX - x) * snapPull
-            scrollView.setContentOffset(CGPoint(x: snappedX, y: scrollView.contentOffset.y), animated: false)
-        }
-
-        private func stopGlide() {
-            displayLink?.invalidate()
-            displayLink = nil
-            glide = nil
-            trackingStartedAt = nil
-        }
-
-        private func rebase() {
-            guard !isRebasing, glide == nil, loop.albumCount > 1, let scrollView = observedScrollView,
-                  let firstCenter = firstSlotCenter(in: scrollView) else { return }
-            let sourceX = scrollView.contentOffset.x
-            let slot = Int(((sourceX + scrollView.bounds.width / 2 - firstCenter) / slotPitch).rounded())
-            let realSlot = loop.realSlot(for: slot)
-            guard realSlot != slot else { return }
-            let offset = firstCenter + CGFloat(slot) * slotPitch - sourceX - scrollView.bounds.width / 2
-            let translation = CGFloat(realSlot - slot) * slotPitch
-            let targetX = sourceX + translation
-            let targetOffset = offset + translation - (targetX - sourceX)
-            guard loop.albumIndex(for: realSlot) == loop.albumIndex(for: slot),
-                  abs(targetOffset - offset) < 0.000_001,
-                  targetX >= -scrollView.adjustedContentInset.left,
-                  targetX <= scrollView.contentSize.width - scrollView.bounds.width + scrollView.adjustedContentInset.right else { return }
-            isRebasing = true
-            defer { isRebasing = false }
-            // Only a drag or a new motion rebases; an active glide never shifts copies.
-            if let settledSlot { self.settledSlot = settledSlot + realSlot - slot }
-            // Bounds translation leaves the native pan gesture active. No animated scroll/snap is requested.
-            var bounds = scrollView.bounds
-            bounds.origin.x = targetX
-            UIView.performWithoutAnimation { scrollView.bounds = bounds }
-        }
+        .frame(width: metrics.side, height: metrics.side)
+        .clipShape(shape)
+        // A hairline of glass on the edge keeps dark covers off the black floor.
+        .overlay(shape.strokeBorder(Color.white.opacity(0.10), lineWidth: 0.5))
     }
-
-    final class ProbeView: UIView {
-        weak var state: State?
-        override func didMoveToSuperview() { super.didMoveToSuperview(); state?.connect() }
-        override func didMoveToWindow() { super.didMoveToWindow(); state?.connect() }
-        override func layoutSubviews() { super.layoutSubviews(); state?.connect() }
-    }
-
-    let state: State
-    let loop: CoverFlowLoop
-    let slotPitch: CGFloat
-    let slotWidth: CGFloat
-    let onCenteredSlot: (Int) -> Void
-
-    func makeUIView(context: Context) -> ProbeView {
-        let view = ProbeView()
-        view.isUserInteractionEnabled = false
-        view.state = state
-        state.onCenteredSlot = onCenteredSlot
-        state.configure(view: view, loop: loop, slotPitch: slotPitch, slotWidth: slotWidth)
-        return view
-    }
-
-    func updateUIView(_ uiView: ProbeView, context: Context) {
-        state.onCenteredSlot = onCenteredSlot
-        state.configure(view: uiView, loop: loop, slotPitch: slotPitch, slotWidth: slotWidth)
-    }
-
-    static func dismantleUIView(_ uiView: ProbeView, coordinator: ()) { uiView.state?.disconnect() }
 }
+
+private struct CoverFlowStage: View {
+    let albums: [CoverFlowAlbum]
+    let motion: CoverFlowMotion
+    let metrics: CoverFlowMetrics
+    let onTap: (Int) -> Void
+
+    var body: some View {
+        // The only view that reads `position`, so only the covers redraw per frame.
+        let position = motion.position
+        ZStack {
+            ForEach(metrics.visibleSlots(around: position, count: albums.count), id: \.self) { slot in
+                let distance = Double(slot) - position
+                CoverFlowCover(album: albums[CoverFlowMotion.albumIndex(for: slot, count: albums.count)],
+                               metrics: metrics)
+                    .contentShape(Rectangle())
+                    .onTapGesture { onTap(slot) }
+                    .modifier(CoverFlowPlacement(distance: distance, metrics: metrics))
+                    .zIndex(-abs(distance))
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: metrics.stageHeight)
+    }
+}
+
+// MARK: - Page
 
 @MainActor
 struct CoverFlowView: View {
     let viewModel: PlayerViewModel
     let safeInsets: EdgeInsets
-    @EnvironmentObject private var appearance: AppearanceSettings
+    @State private var motion = CoverFlowMotion()
     @State private var centeredAlbumID: String?
     @State private var centeredTrackID: String?
-    @State private var centeredSlotID: Int?
-    @State private var scrollProbe = CoverFlowScrollProbe.State()
+    @GestureState private var isTouching = false
 
     var body: some View {
         GeometryReader { geometry in
             let albums = viewModel.coverFlowAlbums
-            let topInset = max(safeInsets.top, 8)
-            let bottomInset = max(safeInsets.bottom, 8)
-            let availableHeight = geometry.size.height - topInset - bottomInset
-            let coverSide = min(200, max(100, (availableHeight - 62) / 1.65))
-            let coverHeight = coverSide * 1.65
-            let sideInset = max(20, safeInsets.leading, safeInsets.trailing)
-            let slotWidth = coverSide * 0.78
-            let loop = CoverFlowLoop(albumCount: albums.count,
-                                     visibleSlotCount: Int(ceil(geometry.size.width / (slotWidth + 5))))
+            let metrics = CoverFlowMetrics(size: geometry.size, insets: safeInsets)
+            let centered = albums.first { $0.id == centeredAlbumID }
 
             ZStack {
-                // The reflection fades into a full-page black surface in every theme.
+                // The reflection fades into a full-page black floor in every theme.
                 Color.black.ignoresSafeArea()
+                // A faint pool of light behind the centre cover.
+                RadialGradient(colors: [Color.white.opacity(0.07), Color.white.opacity(0)],
+                               center: UnitPoint(x: 0.5, y: 0.42),
+                               startRadius: 0, endRadius: geometry.size.width * 0.42)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
 
                 if albums.isEmpty {
                     emptyState
-                        .padding(.horizontal, sideInset)
+                        .padding(.horizontal, metrics.sideInset)
                 } else {
-                    VStack(spacing: 14) {
-                        covers(albums, loop: loop, viewportWidth: geometry.size.width,
-                               side: coverSide, slotWidth: slotWidth, height: coverHeight)
+                    VStack(spacing: CoverFlowMetrics.spacing) {
+                        CoverFlowStage(albums: albums, motion: motion, metrics: metrics) { slot in
+                            tapped(slot)
+                        }
+                        // Stacks melt into the dark at the screen edges. Taller than the
+                        // stage so turned covers' near edges are never cut off.
+                        .mask { edgeFade.padding(.vertical, -60) }
 
-                        if let album = albums.first(where: { $0.id == centeredAlbumID }) {
-                            infoPanel(album)
-                                .frame(maxWidth: 580)
-                                .padding(.horizontal, sideInset)
+                        ZStack { infoPanel(centered) }
+                            .frame(maxWidth: 580)
+                            .frame(height: CoverFlowMetrics.panelHeight)
+                            .padding(.horizontal, metrics.sideInset)
+                            .animation(.easeOut(duration: 0.16), value: centeredAlbumID)
+                    }
+                    .padding(.top, metrics.topInset)
+                    .padding(.bottom, metrics.bottomInset)
+                    .frame(maxHeight: .infinity)
+                    .accessibilityElement(children: .ignore)
+                    // Library names are user data, not app copy.
+                    .accessibilityLabel(Text(verbatim: centered.map { $0.title + "，" + $0.artist } ?? ""))
+                    .accessibilityHint(Text(hintText(for: centered)))
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityAction {
+                        if let centered { viewModel.playCoverFlowAlbum(centered) }
+                    }
+                    .accessibilityAdjustableAction { direction in
+                        switch direction {
+                        case .increment: motion.step(1)
+                        case .decrement: motion.step(-1)
+                        @unknown default: break
                         }
                     }
-                    .frame(maxHeight: .infinity, alignment: .center)
-                    .padding(.top, topInset)
-                    .padding(.bottom, bottomInset)
                 }
             }
             .foregroundStyle(Color.white)
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
-            .onAppear { scrollProbe.connect(); reconcileSelection(albums, loop: loop) }
-            .onChange(of: viewModel.coverFlowIdentity) { _, _ in reconcileSelection(albums, loop: loop) }
-            .onChange(of: loop.slotCount) { _, _ in reconcileSelection(albums, loop: loop) }
-            .onChange(of: centeredSlotID) { _, slot in
-                selectSlot(slot, albums: albums, loop: loop)
+            .contentShape(Rectangle())
+            .gesture(drag(pitch: metrics.dragPitch))
+            // Entering Cover Flow always opens on the song that is playing.
+            .onAppear { reconcile(preferPlaying: true) }
+            .onChange(of: viewModel.coverFlowIdentity) { _, _ in reconcile(preferPlaying: false) }
+            .onChange(of: motion.centeredIndex) { _, slot in centeredSlotChanged(slot) }
+            .onChange(of: viewModel.currentTrack?.id) { previous, _ in followPlayback(from: previous) }
+            // A drag the system cancels (rotation, an alert) never reports onEnded.
+            .onChange(of: isTouching) { _, touching in
+                if !touching { motion.endDrag(velocity: 0) }
             }
-            .onDisappear { scrollProbe.disconnect() }
-            .task(id: centeredAlbumID) {
-                // Warm the whole visible ring, not just the two covers either side,
-                // and start immediately after the wheel settles. Flicking used to
-                // land on placeholders while the previous neighbours were still
-                // queued behind six connections. The short debounce only exists so
-                // a continuous spin does not queue every album it passes.
-                do { try await Task.sleep(nanoseconds: 80_000_000) } catch { return }
-                guard !Task.isCancelled, let albumID = centeredAlbumID,
-                      let index = albums.firstIndex(where: { $0.id == albumID }) else { return }
-                var urls: [URL] = []
-                for offset in -4...4 {
-                    let album = albums[loop.albumIndex(for: index + offset)]
-                    if let url = album.artworkURL { urls.append(url) }
-                }
-                guard !urls.isEmpty else { return }
-                await CachedImageLoader.shared.prefetch(urls)
-            }
+            .onDisappear { motion.stop() }
+            .task(id: centeredAlbumID) { await prefetchNeighbours() }
         }
     }
 
-    private func covers(_ albums: [CoverFlowAlbum], loop: CoverFlowLoop, viewportWidth: CGFloat,
-                        side: CGFloat, slotWidth: CGFloat, height: CGFloat) -> some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            LazyHStack(spacing: 5) {
-                ForEach(0..<loop.slotCount, id: \.self) { slot in
-                    Color.clear
-                        .frame(width: slotWidth, height: height)
-                        .anchorPreference(key: CoverFlowSlotAnchors.self, value: .bounds) { [slot: $0] }
-                        .id(slot)
+    // MARK: Input
+
+    private func drag(pitch: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 6)
+            .updating($isTouching) { _, touching, _ in touching = true }
+            .onChanged { value in
+                let slots = -Double(value.translation.width / pitch)
+                if motion.isDragging {
+                    motion.drag(to: slots)
+                } else {
+                    // Measured from here, so the 6pt slop never jolts the flow.
+                    motion.beginDrag(at: slots)
                 }
             }
-            .scrollTargetLayout()
-            .overlayPreferenceValue(CoverFlowSlotAnchors.self) { anchors in
-                GeometryReader { geometry in
-                    let contentX = geometry.frame(in: .named("coverFlow")).minX
-                    // All covers are siblings: resolve their live anchors once for transforms AND z-order.
-                    ZStack(alignment: .topLeading) {
-                        ForEach(anchors.keys.sorted(), id: \.self) { slot in
-                            if let anchor = anchors[slot] {
-                                let album = albums[loop.albumIndex(for: slot)]
-                                let bounds = geometry[anchor]
-                                let offset = bounds.midX + contentX - viewportWidth / 2
-                                let distance = offset / side
-                                let scale = 1.3 - 0.44 * min(1, abs(distance))
-                                let isCentered = centeredSlotID == slot
-                                Button {
-                                    guard centeredAlbumID == album.id, centeredSlotID == slot else { return }
-                                    // A scrolling candidate must also have reached the centre.
-                                    guard abs(distance) < 0.25 else { return }
-                                    viewModel.playCoverFlowAlbum(album)
-                                } label: {
-                                    CachedArtwork(url: album.artworkURL) { image in
-                                        VStack(spacing: 4) {
-                                            artwork(image, side: side)
-                                                .shadow(color: .black.opacity(Double(0.32 - 0.20 * min(1, abs(distance)))),
-                                                        radius: 12 - 8 * min(1, abs(distance)), y: 7)
-                                            // Mirror the same decoded image; reflection never loads a URL.
-                                            artwork(image, side: side)
-                                                .scaleEffect(x: 1, y: -1)
-                                                .frame(height: side * 0.22, alignment: .top)
-                                                .clipped()
-                                                .mask(LinearGradient(colors: [.black.opacity(0.35), .clear],
-                                                                     startPoint: .top, endPoint: .bottom))
-                                                .accessibilityHidden(true)
-                                        }
-                                    }
-                                    .scaleEffect(scale)
-                                    .rotation3DEffect(.degrees(Double(min(max(distance, -1), 1)) * -32),
-                                                      axis: (x: 0, y: 1, z: 0), perspective: 0.6)
-                                    .opacity(max(0.55, 1 - abs(Double(distance)) * 0.18))
-                                    .frame(width: side * scale, height: height)
-                                    .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                // The narrow scroll slot allows overlap; the centre stays above its neighbours.
-                                .frame(width: slotWidth, height: height)
-                                // Library names are user data, not app copy.
-                                .accessibilityLabel(Text(verbatim: album.title + "，" + album.artist))
-                                .accessibilityHint(viewModel.isCurrentCoverFlowAlbum(album)
-                                                   ? "轻点暂停或继续播放"
-                                                   : (album.tracks.count > 1 ? "轻点播放专辑中的歌曲" : "轻点播放这首歌曲"))
-                                .accessibilityHidden(!isCentered)
-                                .position(x: bounds.midX, y: bounds.midY)
-                                .zIndex(-abs(distance))
-                            }
-                        }
-                    }
-                }
+            .onEnded { value in
+                motion.endDrag(velocity: -Double(value.velocity.width / pitch))
             }
-            .background(CoverFlowScrollProbe(state: scrollProbe, loop: loop,
-                                             slotPitch: slotWidth + 5, slotWidth: slotWidth,
-                                             onCenteredSlot: { centeredSlotID = $0 }))
-        }
-        .contentMargins(.horizontal, max(0, (viewportWidth - slotWidth) / 2), for: .scrollContent)
-        .coordinateSpace(name: "coverFlow")
-        // The UIKit probe owns position; binding a SwiftUI scroll target here
-        // could override the exact glide endpoint after selection or rebasing.
-        .scrollClipDisabled()
-        .frame(height: height)
-        .accessibilityAdjustableAction { direction in
-            guard !albums.isEmpty else { return }
-            let current = centeredSlotID ?? loop.realSlot(for: 0)
-            let delta: Int
-            switch direction {
-            case .increment: delta = 1
-            case .decrement: delta = -1
-            @unknown default: return
-            }
-            // Accessibility uses the same movable glide target, including while a copy rebases.
-            if scrollProbe.step(direction: delta) { return }
-            var transaction = Transaction(animation: nil)
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                let slot = loop.steppedSlot(from: current, direction: delta)
-                centeredSlotID = slot
-                scrollProbe.center(on: slot)
-            }
+    }
+
+    /// A side cover glides to the centre; the centred cover plays (or pauses).
+    private func tapped(_ slot: Int) {
+        let albums = viewModel.coverFlowAlbums
+        let index = CoverFlowMotion.albumIndex(for: slot, count: albums.count)
+        guard albums.indices.contains(index) else { return }
+        if slot == motion.centeredIndex, abs(motion.position - Double(slot)) < 0.2 {
+            viewModel.playCoverFlowAlbum(albums[index])
+        } else {
+            motion.glide(to: Double(slot))
         }
     }
 
-    private func artwork(_ image: Image?, side: CGFloat) -> some View {
-        Group {
-            if let image {
-                image.resizable().scaledToFill()
-            } else {
-                ZStack {
-                    Color(white: 0.12)
-                    Image(systemName: "music.note")
-                        .font(.system(size: 38, weight: .light))
-                        .foregroundStyle(Color(white: 0.76))
-                }
-            }
+    // MARK: Selection
+
+    private func reconcile(preferPlaying: Bool) {
+        let albums = viewModel.coverFlowAlbums
+        let previousCount = motion.count
+        motion.configure(count: albums.count)
+        guard !albums.isEmpty else {
+            motion.jump(to: 0)
+            centeredAlbumID = nil
+            centeredTrackID = nil
+            return
         }
-        .frame(width: side, height: side)
-        .clipShape(RoundedRectangle(cornerRadius: Metrics.artworkRadius, style: .continuous))
+        let playing = albums.firstIndex { viewModel.isCurrentCoverFlowAlbum($0) }
+        // Keep focus when resolving a real track adds artwork and changes its album ID.
+        let kept = albums.firstIndex { $0.id == centeredAlbumID }
+            ?? albums.firstIndex { album in album.tracks.contains { $0.id == centeredTrackID } }
+        let index = (preferPlaying ? (playing ?? kept) : (kept ?? playing)) ?? 0
+        centeredAlbumID = albums[index].id
+        centeredTrackID = albums[index].tracks.first?.id
+        // Same list, same cover in the middle: leave a running glide alone.
+        if !preferPlaying, previousCount == albums.count,
+           motion.albumIndex(for: motion.centeredIndex) == index { return }
+        motion.jump(to: index)
     }
 
-    private func infoPanel(_ album: CoverFlowAlbum) -> some View {
-        let track = displayedTrack(in: album)
-        return VStack(spacing: 3) {
-            Text(verbatim: track?.title ?? "")
-                .font(AppFont.body)
-                .fontWeight(.semibold)
-                .lineLimit(1)
-            Text(verbatim: track?.artist ?? "")
-                .font(AppFont.detail)
-                .foregroundStyle(Color(white: 0.70))
-                .lineLimit(1)
+    private func centeredSlotChanged(_ slot: Int) {
+        let albums = viewModel.coverFlowAlbums
+        let index = CoverFlowMotion.albumIndex(for: slot, count: albums.count)
+        guard albums.indices.contains(index) else { return }
+        let album = albums[index]
+        guard album.id != centeredAlbumID else { return }
+        centeredAlbumID = album.id
+        centeredTrackID = album.tracks.first?.id
+        HapticEngine.shared.tick()
+    }
+
+    /// When the song changes while the flow is resting on it (the track ended,
+    /// next/previous from the lock screen), the flow follows to the new song.
+    /// Someone browsing elsewhere is left where they are.
+    private func followPlayback(from previousID: String?) {
+        guard !motion.isDragging, let previousID else { return }
+        let albums = viewModel.coverFlowAlbums
+        guard let centered = albums.first(where: { $0.id == centeredAlbumID }),
+              centered.tracks.contains(where: { $0.id == previousID }),
+              let index = albums.firstIndex(where: { viewModel.isCurrentCoverFlowAlbum($0) }) else { return }
+        motion.glide(to: Double(motion.nearestSlot(for: index)))
+    }
+
+    private func prefetchNeighbours() async {
+        // Short debounce: a continuous spin should not queue every cover it passes.
+        do { try await Task.sleep(nanoseconds: 80_000_000) } catch { return }
+        let albums = viewModel.coverFlowAlbums
+        guard !Task.isCancelled, let albumID = centeredAlbumID,
+              let index = albums.firstIndex(where: { $0.id == albumID }) else { return }
+        var urls: [URL] = []
+        for offset in -6...6 {
+            let neighbour = albums[CoverFlowMotion.albumIndex(for: index + offset, count: albums.count)]
+            if let url = neighbour.artworkURL, !urls.contains(url) { urls.append(url) }
         }
-        .multilineTextAlignment(.center)
-        // A floating glass capsule that hugs the title instead of a bare line of
-        // text on the reflection. The page is black in every theme, so the glass is
-        // forced to its dark variant — otherwise a light system setting would turn it
-        // white under white text.
-        .padding(.horizontal, 22)
-        .padding(.vertical, 9)
-        .lcdGlass(in: Capsule(), fallback: .ultraThinMaterial)
-        .environment(\.colorScheme, .dark)
+        guard !urls.isEmpty else { return }
+        await CachedImageLoader.shared.prefetch(urls)
+    }
+
+    // MARK: Pieces
+
+    @ViewBuilder
+    private func infoPanel(_ album: CoverFlowAlbum?) -> some View {
+        if let album {
+            let track = displayedTrack(in: album)
+            let isCurrent = viewModel.isCurrentCoverFlowAlbum(album)
+            HStack(spacing: 9) {
+                if isCurrent {
+                    Image(systemName: viewModel.isPlaying ? "speaker.wave.2.fill" : "pause.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color(white: 0.82))
+                }
+                VStack(spacing: 2) {
+                    Text(verbatim: track?.title ?? album.title)
+                        .font(AppFont.body)
+                        .fontWeight(.semibold)
+                        .lineLimit(1)
+                    Text(verbatim: track?.artist ?? album.artist)
+                        .font(AppFont.detail)
+                        .foregroundStyle(Color(white: 0.68))
+                        .lineLimit(1)
+                }
+                .multilineTextAlignment(.center)
+            }
+            // A floating glass capsule that hugs the title. The page is black in every
+            // theme, so the glass is forced to its dark variant — otherwise a light
+            // system setting would turn it white under white text.
+            .padding(.horizontal, 22)
+            .padding(.vertical, 9)
+            .lcdGlass(in: Capsule(), fallback: .ultraThinMaterial)
+            .environment(\.colorScheme, .dark)
+            .id(album.id)
+            .transition(.opacity.combined(with: .scale(scale: 0.97)))
+        }
     }
 
     private func displayedTrack(in album: CoverFlowAlbum) -> Track? {
@@ -600,42 +562,23 @@ struct CoverFlowView: View {
         return album.tracks.first(where: { $0.id == centeredTrackID }) ?? album.tracks.first
     }
 
+    private func hintText(for album: CoverFlowAlbum?) -> String {
+        guard let album else { return "" }
+        if viewModel.isCurrentCoverFlowAlbum(album) { return "轻点暂停或继续播放" }
+        return album.tracks.count > 1 ? "轻点播放专辑中的歌曲" : "轻点播放这首歌曲"
+    }
+
+    private var edgeFade: some View {
+        LinearGradient(stops: [
+            .init(color: .clear, location: 0),
+            .init(color: .black, location: 0.10),
+            .init(color: .black, location: 0.90),
+            .init(color: .clear, location: 1)
+        ], startPoint: .leading, endPoint: .trailing)
+    }
+
     private var emptyState: some View {
         // Neutral on the black page: a theme accent (mint, sunset) jumps out of it.
         LCDEmptyState(message: "暂无歌曲", symbol: "square.stack", tint: Color(white: 0.70))
-    }
-
-    private func selectSlot(_ slot: Int?, albums: [CoverFlowAlbum], loop: CoverFlowLoop) {
-        guard let slot, !albums.isEmpty, (0..<loop.slotCount).contains(slot) else { return }
-        let album = albums[loop.albumIndex(for: slot)]
-        guard centeredAlbumID != album.id else { return }
-        let hadSelection = centeredAlbumID != nil
-        centeredAlbumID = album.id
-        centeredTrackID = album.tracks.first?.id
-        if hadSelection { HapticEngine.shared.tick() }
-    }
-
-    private func reconcileSelection(_ albums: [CoverFlowAlbum], loop: CoverFlowLoop) {
-        scrollProbe.cancelMotion()
-        // Keep focus when resolving a real track adds artwork and changes its album ID.
-        let retained = albums.first { $0.id == centeredAlbumID }
-        let remembered = albums.first { album in
-            album.tracks.contains { $0.id == centeredTrackID }
-        }
-        let playing = albums.first { viewModel.isCurrentCoverFlowAlbum($0) }
-        let album = retained ?? remembered ?? playing ?? albums.first
-        centeredAlbumID = album?.id
-        centeredTrackID = album?.tracks.first?.id
-        if let index = albums.firstIndex(where: { $0.id == album?.id }) {
-            var transaction = Transaction(animation: nil)
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                let slot = loop.realSlot(for: index)
-                centeredSlotID = slot
-                scrollProbe.center(on: slot)
-            }
-        } else {
-            centeredSlotID = nil
-        }
     }
 }

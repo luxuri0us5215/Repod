@@ -6,6 +6,11 @@ import UIKit
 struct NowPlayingView: View {
     let viewModel: PlayerViewModel
     @ObservedObject var clock: PlaybackClock
+    /// 3.1.3: the LCD band behind the Dynamic Island / status bar. The screen now
+    /// runs up under it (the cover glow included) and the glass title strip covers
+    /// it, as on every list. Before, the band was padded off in flat midnight and
+    /// met the glowing backdrop in a hard seam.
+    var safeTop: CGFloat = 0
     private let displayPalette = AppThemePreset.midnight.palette
     @Environment(\.scenePhase) private var scenePhase
     @State private var displayedTrack: Track?
@@ -46,9 +51,9 @@ struct NowPlayingView: View {
         // The status row is a real row now, not an overlay with a matching magic
         // top padding, so the cover budget below is the sum of the rows.
         VStack(alignment: .leading, spacing: 0) {
-            statusRow
+            // 3.1.3: the status marks moved into the top row (see `topRow`).
             brandHeader(source: viewModel.currentTrack?.source ?? viewModel.selectedSource)
-                .padding(.top, Layout.statusToBrand)
+                .padding(.top, Layout.stripToBrand)
 
             if let track = displayedTrack {
                 trackBlock(track, in: geometry)
@@ -68,17 +73,68 @@ struct NowPlayingView: View {
                 }
             }
         }
-        .padding(Layout.inset)
+        .padding(.horizontal, Layout.inset)
+        .padding(.bottom, Layout.inset)
+        .padding(.top, safeTop + Layout.stripHeight)
         .frame(width: geometry.size.width, height: geometry.size.height)
-        .background(displayPalette.lcdBackground)
+        // 3.1: the screen is lit by the song — a slow-drifting blur of its cover
+        // under a dark wash, instead of a flat midnight panel. It fills the whole
+        // LCD, the band under the glass strip included.
+        .background {
+            NowPlayingBackdrop(url: (displayedTrack ?? viewModel.currentTrack)?.artworkURL,
+                               base: displayPalette.lcdBackground)
+        }
+        .overlay(alignment: .top) { topRow }
+    }
+
+    /// The list header's row (title on the left, play/pause and playback mode on the
+    /// right, 30pt plus the band above it), in the Now Playing screen's own midnight
+    /// palette. 3.1.5: drawn on the backdrop itself, not on a glass strip.
+    private var topRow: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Text(verbatim: viewModel.currentScreen.title)
+                    .font(AppFont.header)
+                    .foregroundStyle(displayPalette.lcdText)
+                    .lineLimit(1)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer(minLength: 4)
+                let hasTrack = viewModel.currentTrack != nil
+                StatusGlyph(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill",
+                            label: viewModel.isPlaying ? "暂停" : "播放",
+                            inkHeight: Metrics.statusGlyphInkHeight,
+                            slotWidth: Metrics.statusGlyphSlot,
+                            tint: displayPalette.lcdText)
+                    .opacity(hasTrack ? 1 : 0)
+                    .accessibilityHidden(!hasTrack)
+                    .transaction { $0.animation = nil; $0.disablesAnimations = true }
+                StatusGlyph(systemName: viewModel.playbackMode.symbolName,
+                            label: viewModel.playbackMode.displayName,
+                            inkHeight: Metrics.statusGlyphInkHeight,
+                            slotWidth: Metrics.statusGlyphSlot,
+                            tint: displayPalette.lcdSecondaryText)
+                    .padding(.trailing, 2)
+            }
+            .padding(.horizontal, Metrics.horizontalInset)
+            .frame(height: Metrics.headerHeight)
+            .padding(.top, safeTop)
+            // Keeps the 0.5pt the old divider took, so the layout budget is unchanged.
+            Color.clear.frame(height: 0.5)
+        }
+        // 3.1.5: no surface of its own. The row sits straight on the cover-lit
+        // backdrop, whose top wash already darkens this band, so Now Playing is one
+        // continuous block from the top edge down instead of a glass strip laid
+        // over a second panel.
     }
 
     /// Every fixed height on this screen, so the cover's budget is a sum instead of
     /// a number somebody once measured.
     private enum Layout {
         static let inset: CGFloat = 18
-        /// 18 + 22 + 12: the source mark keeps the 52pt top it had in 2.0.
-        static let statusToBrand: CGFloat = 12
+        /// The top row (30pt + 0.5pt), drawn over the content.
+        static let stripHeight: CGFloat = Metrics.headerHeight + 0.5
+        /// Air between the strip and the source mark.
+        static let stripToBrand: CGFloat = 16
         static let brandHeight: CGFloat = 32
         /// Minimum air above and below the cover. On a tall screen the cover is
         /// centred and the air grows; on a short one it is exactly this.
@@ -87,14 +143,14 @@ struct NowPlayingView: View {
         static let progressHeight: CGFloat = 28
         static let coverTextGap: CGFloat = 14
         static var chrome: CGFloat {
-            inset * 2 + Metrics.statusGlyphInkHeightLarge + statusToBrand + brandHeight
+            inset + stripHeight + stripToBrand + brandHeight
                 + coverGap * 2 + progressHeight
         }
     }
 
     private func trackBlock(_ track: Track, in geometry: GeometryProxy) -> some View {
         let artworkSide = max(64, min(180, (geometry.size.width - Layout.inset * 2) / 2,
-                                      geometry.size.height - Layout.chrome))
+                                      geometry.size.height - safeTop - Layout.chrome))
         return ZStack {
             HStack(alignment: .center, spacing: Layout.coverTextGap) {
                 // No `.clipped()` here: the face clips itself, and a frame clip would
@@ -259,7 +315,7 @@ struct NowPlayingView: View {
     private func titleText(_ title: String) -> Text {
         // Song titles are user data, never app copy.
         let text = Text(verbatim: title)
-        return isLatinTitle(title) ? text.italic() : text
+        return Self.isLatinTitle(title) ? text.italic() : text
     }
 
     /// The heart's confirmation burst belongs to one track only. Kept out of the
@@ -270,7 +326,7 @@ struct NowPlayingView: View {
         return viewModel.likeAnimation
     }
 
-    private func isLatinTitle(_ title: String) -> Bool {
+    static func isLatinTitle(_ title: String) -> Bool {
         // Ignore punctuation, digits and combining accents; every letter must
         // be Latin. Mixed Latin/CJK titles keep all their glyphs upright.
         let letters = title.unicodeScalars.filter { CharacterSet.letters.contains($0)
@@ -287,22 +343,26 @@ struct NowPlayingView: View {
     }
 
     private func artwork(url: URL?, side: CGFloat) -> some View {
-        CachedArtwork(url: url) { image in
-            ZStack {
-                if let image, Metrics.artworkGlowOpacity > 0 {
-                    // The cover's own colours bleeding softly out from behind it, like an
-                    // LCD backlight. Clipped to the cover's square first so a non-square
-                    // image cannot spill, then blurred.
-                    Color.clear
-                        .overlay { image.resizable().scaledToFill() }
-                        .clipped()
-                        .blur(radius: 18)
-                        .opacity(Metrics.artworkGlowOpacity)
-                        .scaleEffect(1.04)
-                        .offset(y: 6)
-                        .accessibilityHidden(true)
+        // The cover and its backlight lean with the phone; the rest of the screen
+        // stays put, so the card reads as an object sitting on the glass.
+        ArtworkTilt(cornerRadius: Metrics.nowPlayingArtworkRadius) {
+            CachedArtwork(url: url) { image in
+                ZStack {
+                    if let image, Metrics.artworkGlowOpacity > 0 {
+                        // The cover's own colours bleeding softly out from behind it, like an
+                        // LCD backlight. Clipped to the cover's square first so a non-square
+                        // image cannot spill, then blurred.
+                        Color.clear
+                            .overlay { image.resizable().scaledToFill() }
+                            .clipped()
+                            .blur(radius: 18)
+                            .opacity(Metrics.artworkGlowOpacity)
+                            .scaleEffect(1.04)
+                            .offset(y: 6)
+                            .accessibilityHidden(true)
+                    }
+                    artworkFace(image, side: side)
                 }
-                artworkFace(image, side: side)
             }
         }
         .accessibilityLabel(url == nil ? "专辑封面占位图" : "专辑封面")
@@ -493,5 +553,190 @@ private struct SpotifyArcs: Shape {
                               control: CGPoint(x: rect.width * 0.52, y: rect.height * (y - 0.13)))
         }
         return path
+    }
+}
+
+// MARK: - 3.1 backdrop and immersive screen
+
+/// The song's cover, blurred and slowly drifting under a dark wash: the light the
+/// screen gives off while it plays. Reduce Transparency keeps the flat panel;
+/// Reduce Motion keeps it still.
+@MainActor
+struct NowPlayingBackdrop: View {
+    let url: URL?
+    let base: Color
+    /// How dark the wash over the blur is (1 = the in-LCD screen).
+    var wash: Double = 1
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @State private var drift = false
+
+    var body: some View {
+        GeometryReader { geometry in
+            let size = geometry.size
+            ZStack {
+                base
+                if !reduceTransparency {
+                    CachedArtwork(url: url) { image in
+                        if let image {
+                            image
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: size.width * 1.6, height: size.height * 1.6)
+                                .blur(radius: 48)
+                                .saturation(1.5)
+                                .opacity(0.62)
+                                .scaleEffect(drift ? 1.16 : 1)
+                                .offset(x: drift ? -size.width * 0.08 : size.width * 0.04,
+                                        y: drift ? size.height * 0.05 : -size.height * 0.03)
+                                .transition(.opacity)
+                        }
+                    }
+                    .frame(width: size.width, height: size.height)
+                    LinearGradient(stops: [
+                        .init(color: Color.black.opacity(0.55 * wash), location: 0),
+                        .init(color: Color.black.opacity(0.18 * wash), location: 0.40),
+                        .init(color: Color.black.opacity(0.62 * wash), location: 1)
+                    ], startPoint: .top, endPoint: .bottom)
+                }
+            }
+            .frame(width: size.width, height: size.height)
+            .clipped()
+        }
+        .animation(.easeInOut(duration: 0.6), value: url)
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.easeInOut(duration: 18).repeatForever(autoreverses: true)) { drift = true }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+/// Optional (Settings → Appearance → Immersive Now Playing): the song fills the
+/// whole phone and the click wheel is clear glass over it. The same four bands
+/// as the LCD screen, in the same order — marks and source, cover, title, progress.
+@MainActor
+struct ImmersiveNowPlayingView: View {
+    let viewModel: PlayerViewModel
+    let safeTop: CGFloat
+    /// Height kept clear at the bottom for the wheel.
+    let wheelSpace: CGFloat
+    private let palette = AppThemePreset.midnight.palette
+
+    var body: some View {
+        GeometryReader { geometry in
+            let track = viewModel.currentTrack
+            let source = track?.source ?? viewModel.selectedSource
+            let side = max(120, min(geometry.size.width - 108, geometry.size.height - wheelSpace - safeTop - 230))
+            ZStack(alignment: .top) {
+                NowPlayingBackdrop(url: track?.artworkURL,
+                                   base: Color(red: 0.02, green: 0.05, blue: 0.07), wash: 0.7)
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(spacing: 9) {
+                        StatusGlyph(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill",
+                                    label: viewModel.isPlaying ? "暂停" : "播放",
+                                    inkHeight: Metrics.statusGlyphInkHeightLarge, tint: palette.lcdText)
+                        StatusGlyph(systemName: viewModel.playbackMode.symbolName,
+                                    label: viewModel.playbackMode.displayName,
+                                    inkHeight: Metrics.statusGlyphInkHeightLarge,
+                                    slotWidth: Metrics.statusGlyphSlotLarge, tint: palette.lcdText)
+                        Spacer(minLength: 0)
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(source == .spotify
+                                      ? Color(red: 29.0 / 255, green: 185.0 / 255, blue: 84.0 / 255)
+                                      : Color(red: 221.0 / 255, green: 0, blue: 27.0 / 255))
+                                .frame(width: 22, height: 22)
+                            Text(verbatim: source == .spotify ? "Spotify" : L10n.text("网易云音乐"))
+                                .font(AppFont.header)
+                                .foregroundStyle(Color.white)
+                        }
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("音源：" + source.displayName)
+                    }
+                    .frame(height: Metrics.statusGlyphInkHeightLarge)
+                    .padding(.top, safeTop + 14)
+
+                    if let track {
+                        cover(track.artworkURL, side: side)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 20)
+                            .id(track.id)
+                            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                title(track.title)
+                                    .font(.system(size: 25, weight: .bold))
+                                    .foregroundStyle(Color.white)
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.8)
+                                if viewModel.trackLikeID(for: track) != nil {
+                                    TrackLikeHeart(isLiked: viewModel.isLiked(track), confirmation: nil,
+                                                   showsOutline: false)
+                                }
+                            }
+                            Text(verbatim: track.artist)
+                                .font(.system(size: 16))
+                                .foregroundStyle(Color.white.opacity(0.92))
+                                .lineLimit(1)
+                            Text(verbatim: track.album)
+                                .font(AppFont.detail)
+                                .foregroundStyle(Color.white.opacity(0.74))
+                                .lineLimit(1)
+                        }
+                        .padding(.top, 18)
+
+                        NowPlayingProgress(viewModel: viewModel, clock: viewModel.clock)
+                            .padding(.top, 14)
+                    } else {
+                        LCDEmptyState(message: viewModel.emptyStateMessage ?? "暂无歌曲", tint: palette.lcdSecondaryText)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        NowPlayingProgress(viewModel: viewModel, clock: viewModel.clock, hasTrack: false)
+                    }
+                    Spacer(minLength: wheelSpace)
+                }
+                .padding(.horizontal, 28)
+                .animation(.easeOut(duration: 0.3), value: track?.id)
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+        }
+    }
+
+    private func title(_ text: String) -> Text {
+        let title = Text(verbatim: text)
+        return NowPlayingView.isLatinTitle(text) ? title.italic() : title
+    }
+
+    private func cover(_ url: URL?, side: CGFloat) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 26, style: .continuous)
+        return CachedArtwork(url: url) { image in
+            ZStack {
+                if let image {
+                    image.resizable().scaledToFill()
+                        .frame(width: side, height: side)
+                        .blur(radius: 22)
+                        .opacity(0.5)
+                        .offset(y: 8)
+                        .accessibilityHidden(true)
+                    image.resizable().scaledToFill()
+                        .frame(width: side, height: side)
+                        .clipShape(shape)
+                } else {
+                    shape.fill(Color.white.opacity(0.08))
+                        .frame(width: side, height: side)
+                        .overlay {
+                            Image(systemName: "music.note")
+                                .font(.system(size: side * 0.26, weight: .light))
+                                .foregroundStyle(Color.white.opacity(0.6))
+                        }
+                }
+            }
+        }
+        .overlay { shape.strokeBorder(Color.white.opacity(0.14), lineWidth: 1) }
+        .shadow(color: .black.opacity(0.45), radius: 20, y: 14)
+        .frame(width: side, height: side)
+        .accessibilityLabel(url == nil ? "专辑封面占位图" : "专辑封面")
     }
 }

@@ -19,6 +19,9 @@ struct ClickWheelView: View {
     let onSeekBackward: (Double) -> Void
     let onConfirm: () -> Void
     let onConfirmLongPress: () -> Bool
+    /// Clear glass instead of the lacquered ring: the immersive Now Playing lays the
+    /// wheel over the artwork. Geometry, keys and gestures are the same.
+    var glass: Bool = false
 
     @EnvironmentObject private var appearance: AppearanceSettings
     @Environment(\.scenePhase) private var scenePhase
@@ -36,6 +39,10 @@ struct ClickWheelView: View {
     @State private var ringHoldTask: Task<Void, Never>?
     @State private var menuHoldTask: Task<Void, Never>?
     @State private var longPressFired = false
+    /// Where the thumb is on the ring (radians, as `angle(at:)` measures), and
+    /// whether the refraction that follows it is showing.
+    @State private var touchAngle: Double = -Double.pi / 2
+    @State private var touchVisible = false
 
     private enum KeyZone: Hashable {
         case menu, previous, next, playPause, confirm
@@ -45,18 +52,15 @@ struct ClickWheelView: View {
     private var ringInnerRadius: CGFloat { diameter * 0.195 }
     private var labelOffset: CGFloat { diameter * 0.365 }
 
-    private var usesBlackRing: Bool { appearance.effectiveThemePreset == .classic }
-
-    /// The ring's base lacquer, lit corner first: the light comes from the upper left.
-    private var ringColors: [Color] {
-        usesBlackRing ? [Color(white: 0.17), Color(white: 0.07)] : [.white, Color(white: 0.91)]
+    /// 3.1.5: one ink rule for the glass wheel — white on a dark body (and on the
+    /// immersive clear glass), a soft graphite on a light one.
+    private var labelInk: Color {
+        glass || appearance.theme.isDark ? Color.white.opacity(0.92) : Color(white: 0.36)
     }
 
-    private var centreButtonColors: [Color] {
-        pressedZone == .confirm
-            ? [appearance.theme.headerBottom, appearance.theme.headerTop]
-            : [appearance.theme.headerTop, appearance.theme.headerBottom]
-    }
+    /// 3.1.8: half the length of the refractive arc under the thumb, in radians
+    /// (0.8 ≈ 46° each side, so the arc covers about a quarter of the wheel).
+    private static let refractionHalfArc: CGFloat = 0.8
 
     var body: some View {
         ZStack {
@@ -65,35 +69,31 @@ struct ClickWheelView: View {
             // 3D transform (it renders black), and on a real iPod the centre switch is
             // a separate part from the wheel that rocks beneath it anyway.
             ZStack {
-                discSurface
+                // The shadow sits outside the refraction layer, which only draws
+                // inside the disc's own square.
+                discShadow
 
-                ForEach([KeyZone.menu, .next, .playPause, .previous], id: \.self) { zone in
-                    pressGlow(for: zone)
+                ZStack {
+                    if glass { glassSurface } else { glassDisc }
+
+                    ForEach([KeyZone.menu, .next, .playPause, .previous], id: \.self) { zone in
+                        pressGlow(for: zone)
+                    }
+
+                    keyLabels
                 }
-
-                // The rim's catch-light and the centre key's soft shade sit above the
-                // press light, so a pressed quadrant never dulls them.
-                discSoftEdges
-
-                Text("MENU")
-                    .font(.system(size: diameter * 0.046, weight: .bold, design: .rounded))
-                    .modifier(KeyLabelPress(pressed: pressedZone == .menu))
-                    .offset(y: -labelOffset)
-                WheelSkipGlyph(pointsLeft: true)
-                    .frame(width: diameter * 0.09, height: diameter * 0.05)
-                    .modifier(KeyLabelPress(pressed: pressedZone == .previous))
-                    .offset(x: -labelOffset)
-                WheelSkipGlyph(pointsLeft: false)
-                    .frame(width: diameter * 0.09, height: diameter * 0.05)
-                    .modifier(KeyLabelPress(pressed: pressedZone == .next))
-                    .offset(x: labelOffset)
-                HStack(spacing: 3) {
-                    Image(systemName: "play.fill")
-                    Image(systemName: "pause.fill")
-                }
-                .font(.system(size: diameter * 0.05, weight: .semibold))
-                .modifier(KeyLabelPress(pressed: pressedZone == .playPause))
-                .offset(y: labelOffset)
+                .frame(width: diameter, height: diameter)
+                // 3.1.8: the touch indicator is the glass itself bending — not a spot
+                // but an arc of refraction that fills the whole ring band (centre key
+                // edge to rim) and runs along the ring, centred on the thumb. Whatever
+                // it covers — surface, press light, a key label — is stretched round
+                // the curve; no rim, shadow or outline, and it fades out at every edge.
+                .modifier(WheelRefraction(diameter: diameter,
+                                          innerRadius: ringInnerRadius,
+                                          angle: touchAngle,
+                                          halfArc: Self.refractionHalfArc,
+                                          strength: touchVisible ? 1 : 0))
+                .animation(.spring(response: 0.24, dampingFraction: 0.82), value: touchVisible)
             }
             .animation(.easeOut(duration: 0.14), value: pressedZone)
             // A render transform on drawn content only: the touch surface is the
@@ -106,7 +106,7 @@ struct ClickWheelView: View {
             centreButton
         }
         .font(.system(size: diameter * 0.06, weight: .semibold))
-        .foregroundStyle(usesBlackRing ? .white : Color(white: 0.43))
+        .foregroundStyle(labelInk)
         .frame(width: diameter, height: diameter)
         .contentShape(Circle())
         .gesture(touchGesture)
@@ -148,16 +148,15 @@ struct ClickWheelView: View {
     //
     // Everything below is paint. The geometry, zones and gestures are untouched,
     // and none of these layers takes a touch.
+    //
+    // 3.1.5: the wheel is one disc of thick glass set into the body (it was a
+    // lacquered pebble). No live glass: this all sits inside the press tilt, where a
+    // system glass layer renders black, so the glass is drawn — the body seen through
+    // it, the thickness at the rim, the light carried through and gathered on the far
+    // side, a broad surface sheen and a rim that catches the light twice.
 
-    // The wheel is one soft, rounded pebble lit from the upper left, like the body
-    // around it. There are no edges to find: no bevel, no groove, no streaks. Only
-    // broad gradients that ease in and out, so nothing ever reads as a line or a facet.
-
-    /// Picks a value for the black ring or for the light one.
-    private func finish<T>(dark: T, light: T) -> T { usesBlackRing ? dark : light }
-
-    /// A deeper, more saturated cousin of the theme tint: the colour the lacquer turns
-    /// where it curves into shade, so mint shades green and sunset shades warm, not grey.
+    /// A deeper, more saturated cousin of the theme tint: the colour thick glass
+    /// takes on at its edge, so mint deepens green and sunset warm, not grey.
     private var tintShade: Color {
         var hue: CGFloat = 0, saturation: CGFloat = 0, brightness: CGFloat = 0, alpha: CGFloat = 0
         guard UIColor(appearance.theme.wheelTint)
@@ -167,112 +166,92 @@ struct ClickWheelView: View {
                      brightness: Double(brightness * 0.30))
     }
 
-    /// The colour of the ring's shade: black on the black ring, tinted lacquer on a light one.
-    private var shadeColor: Color { usesBlackRing ? .black : tintShade }
-
-    /// The disc: shadows, then the lacquer curving away from the light.
-    private var discSurface: some View {
-        ZStack {
-            // A bare silhouette casts the shadows, so the blur never has to chew through
-            // the gradient layers: a wide soft one that lets the wheel float on the body,
-            // and only a faint, loose one for contact.
+    /// Glass casts a lighter shadow than lacquer. A bare silhouette casts it, so the
+    /// blur never has to chew through the gradient layers.
+    @ViewBuilder
+    private var discShadow: some View {
+        if glass {
             Circle()
-                .fill(ringColors[1])
+                .fill(Color.white.opacity(0.13))
+                .shadow(color: .black.opacity(0.35), radius: diameter * 0.05, y: diameter * 0.03)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        } else {
+            let dark = appearance.theme.isDark
+            Circle()
+                .fill(appearance.theme.bodyBackground)
                 .padding(0.5)
-                .shadow(color: .black.opacity(finish(dark: 0.14, light: 0.09)),
-                        radius: diameter * 0.014, x: 0, y: diameter * 0.007)
-                .shadow(color: .black.opacity(finish(dark: 0.22, light: 0.17)),
-                        radius: diameter * 0.05, x: 0, y: diameter * 0.028)
-
-            Circle()
-                .fill(LinearGradient(colors: ringColors, startPoint: .topLeading, endPoint: .bottomTrailing))
-                // The lacquer: the theme colour as paint, so mint and sunset read as colour
-                // under the gloss and not as a grey ring.
-                .overlay(Circle().fill(appearance.theme.wheelTint.opacity(finish(dark: 0.07, light: 0.24))))
-                .overlay { if !reduceTransparency { domeLight } }
-                .overlay(edgeRoll)
+                .shadow(color: .black.opacity(dark ? 0.22 : 0.06),
+                        radius: diameter * 0.010, x: 0, y: diameter * 0.005)
+                .shadow(color: .black.opacity(dark ? 0.30 : 0.11),
+                        radius: diameter * 0.045, x: 0, y: diameter * 0.025)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
         }
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
     }
 
-    /// One broad, low-contrast highlight on the upper left of a smooth dome. Eased
-    /// through several stops so it has no visible edge anywhere.
-    private var domeLight: some View {
-        let peak = finish(dark: 0.21, light: 0.44)
-        return Circle()
-            .fill(RadialGradient(
-                stops: [
-                    .init(color: Color.white.opacity(peak), location: 0.00),
-                    .init(color: Color.white.opacity(peak * 0.72), location: 0.22),
-                    .init(color: Color.white.opacity(peak * 0.40), location: 0.48),
-                    .init(color: Color.white.opacity(peak * 0.14), location: 0.74),
-                    .init(color: Color.white.opacity(0), location: 1.00),
-                ],
-                center: UnitPoint(x: 0.35, y: 0.27),
-                startRadius: 0, endRadius: diameter * 0.78))
-    }
+    /// The glass disc, in the body's own colour.
+    private var glassDisc: some View {
+        let dark = appearance.theme.isDark
+        let edge: Color = dark ? .white : tintShade
+        return ZStack {
+            // Seen through the glass: the body behind it, a shade deeper (thick glass
+            // absorbs a little) and lit from the lower right — a lens turns the light over.
+            Circle().fill(appearance.theme.bodyBackground)
+            Circle().fill(LinearGradient(
+                colors: [Color.black.opacity(dark ? 0.10 : 0.06), Color.white.opacity(dark ? 0.05 : 0.20)],
+                startPoint: .topLeading, endPoint: .bottomTrailing))
+            Circle().fill(appearance.theme.wheelTint.opacity(dark ? 0.05 : 0.10))
 
-    /// The surface rolling over toward the rim: a wide, gentle falloff that starts well
-    /// inside the edge and deepens smoothly, instead of a line at the edge.
-    private var edgeRoll: some View {
-        let depth = finish(dark: 0.28, light: 0.15)
-        return Circle()
-            .fill(RadialGradient(
+            // Thickness at the rim: the view bends hard there, so a band just inside
+            // the edge deepens. Eased in from well inside, so it never reads as a line.
+            Circle().fill(RadialGradient(
                 stops: [
-                    .init(color: shadeColor.opacity(0), location: 0.74),
-                    .init(color: shadeColor.opacity(depth * 0.20), location: 0.84),
-                    .init(color: shadeColor.opacity(depth * 0.55), location: 0.93),
-                    .init(color: shadeColor.opacity(depth), location: 1.00),
+                    .init(color: edge.opacity(0), location: 0.62),
+                    .init(color: edge.opacity(dark ? 0.04 : 0.06), location: 0.80),
+                    .init(color: edge.opacity(dark ? 0.12 : 0.20), location: 0.94),
+                    .init(color: edge.opacity(dark ? 0.07 : 0.10), location: 1.00),
                 ],
                 center: .center, startRadius: 0, endRadius: diameter / 2))
-    }
 
-    /// What sits above the press light: a single faint catch-light along the lit rim,
-    /// and the soft shade the centre key's recess throws onto the ring.
-    private var discSoftEdges: some View {
-        // The recess shade is a radial fall-off centred a touch up and to the left, since
-        // the upper-left wall is the one the light does not reach. It is darkest right at
-        // the key's edge and is gone well before the labels, with no outer edge.
-        let reach = diameter * 0.30
-        let shade = usesBlackRing ? Color.black.opacity(0.55) : tintShade.opacity(0.21)
-        let rim = finish(dark: 0.26, light: 0.80)
-        return ZStack {
-            Circle()
-                .fill(RadialGradient(
-                    stops: [
-                        .init(color: shade, location: 0.00),
-                        .init(color: shade, location: 0.56),
-                        .init(color: shade.opacity(0.60), location: 0.66),
-                        .init(color: shade.opacity(0.30), location: 0.77),
-                        .init(color: shade.opacity(0.10), location: 0.88),
-                        .init(color: shade.opacity(0), location: 1.00),
-                    ],
-                    center: .center, startRadius: 0, endRadius: reach))
-                .frame(width: reach * 2, height: reach * 2)
-                .offset(x: -diameter * 0.005, y: -diameter * 0.009)
+            // The light carried through the glass, gathered on the far side.
+            Circle().fill(RadialGradient(
+                colors: [Color.white.opacity(dark ? 0.09 : 0.30), Color.white.opacity(0)],
+                center: UnitPoint(x: 0.68, y: 0.80), startRadius: 0, endRadius: diameter * 0.36))
 
-            // The catch-light: brightest toward the light and fading smoothly to nothing
-            // around both sides, so it never starts or stops anywhere.
+            // The surface sheen: one broad, soft highlight on the upper left.
             if !reduceTransparency {
-                Circle()
-                    .inset(by: 0.5)
-                    .strokeBorder(AngularGradient(
-                        stops: [
-                            .init(color: Color.white.opacity(0), location: 0.300),
-                            .init(color: Color.white.opacity(rim * 0.10), location: 0.380),
-                            .init(color: Color.white.opacity(rim * 0.42), location: 0.470),
-                            .init(color: Color.white.opacity(rim * 0.82), location: 0.550),
-                            .init(color: Color.white.opacity(rim), location: 0.625),
-                            .init(color: Color.white.opacity(rim * 0.82), location: 0.700),
-                            .init(color: Color.white.opacity(rim * 0.42), location: 0.780),
-                            .init(color: Color.white.opacity(rim * 0.10), location: 0.870),
-                            .init(color: Color.white.opacity(0), location: 0.950),
-                            .init(color: Color.white.opacity(0), location: 1.000),
-                        ],
-                        center: .center, angle: .degrees(0)),
-                                  lineWidth: diameter * 0.007)
+                Circle().fill(RadialGradient(
+                    stops: [
+                        .init(color: Color.white.opacity(dark ? 0.16 : 0.42), location: 0.00),
+                        .init(color: Color.white.opacity(dark ? 0.07 : 0.18), location: 0.38),
+                        .init(color: Color.white.opacity(0), location: 1.00),
+                    ],
+                    center: UnitPoint(x: 0.32, y: 0.22), startRadius: 0, endRadius: diameter * 0.56))
             }
+
+            // The well the centre key sits in: the glass curves down into it.
+            Circle().fill(RadialGradient(
+                stops: [
+                    .init(color: edge.opacity(dark ? 0.16 : 0.14), location: 0.80),
+                    .init(color: edge.opacity(0), location: 1.00),
+                ],
+                center: .center, startRadius: 0, endRadius: ringInnerRadius * 1.5))
+                .frame(width: ringInnerRadius * 3, height: ringInnerRadius * 3)
+
+            // The rim catches the key light on the upper left and lets it out again on
+            // the lower right; the sides stay dim. Clockwise from three o'clock.
+            Circle().strokeBorder(AngularGradient(
+                stops: [
+                    .init(color: Color.white.opacity(dark ? 0.20 : 0.45), location: 0.000),
+                    .init(color: Color.white.opacity(dark ? 0.32 : 0.65), location: 0.125),
+                    .init(color: Color.white.opacity(dark ? 0.06 : 0.12), location: 0.375),
+                    .init(color: Color.white.opacity(dark ? 0.55 : 0.95), location: 0.625),
+                    .init(color: Color.white.opacity(dark ? 0.06 : 0.12), location: 0.875),
+                    .init(color: Color.white.opacity(dark ? 0.20 : 0.45), location: 1.000),
+                ],
+                center: .center, angle: .degrees(0)),
+                                  lineWidth: 1.2)
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
@@ -303,8 +282,8 @@ struct ClickWheelView: View {
     /// of light; the radial mask keeps it off the centre key and lets it die out
     /// toward the rim, so there is no edge to read as a shape.
     private func pressGlow(for zone: KeyZone) -> some View {
-        let tint: Color = usesBlackRing ? .white : .black
-        let peak = usesBlackRing ? 0.28 : 0.11
+        let tint: Color = appearance.theme.isDark ? .white : .black
+        let peak = appearance.theme.isDark ? 0.22 : 0.10
         let pressed = pressedZone == zone
         return Circle()
             .fill(AngularGradient(
@@ -360,7 +339,7 @@ struct ClickWheelView: View {
             // closer to the surface, so the shadow tightens. A bare silhouette casts it,
             // never the glass layer.
             Circle()
-                .fill(Color.black)
+                .fill(glass ? Color.black.opacity(0.22) : Color.black)
                 .padding(0.5)
                 .shadow(color: .black.opacity(pressed ? 0.14 : 0.10),
                         radius: diameter * (pressed ? 0.006 : 0.010),
@@ -370,7 +349,18 @@ struct ClickWheelView: View {
                         x: diameter * (pressed ? 0.003 : 0.007),
                         y: diameter * (pressed ? 0.008 : 0.019))
 
-            Circle().fill(LinearGradient(colors: centreButtonColors, startPoint: .top, endPoint: .bottom))
+            if glass {
+                Circle().fill(Color.white.opacity(pressed ? 0.26 : 0.18))
+            } else {
+                // 3.1.5: the same glass as the ring, a little brighter, since it
+                // stands proud of the disc. Pressed, it dims a touch.
+                Circle().fill(appearance.theme.bodyBackground)
+                Circle().fill(LinearGradient(
+                    colors: [Color.white.opacity(darkFace ? 0.10 : 0.30), Color.black.opacity(darkFace ? 0.10 : 0.04)],
+                    startPoint: .top, endPoint: .bottom))
+                Circle().fill(appearance.theme.wheelTint.opacity(darkFace ? 0.05 : 0.10))
+                Circle().fill(Color.black.opacity(pressed ? (darkFace ? 0.14 : 0.07) : 0))
+            }
             if !reduceTransparency {
                 // A domed face: the light pools softly on the upper left. Under the glass,
                 // so the lens edge refracts it.
@@ -451,6 +441,10 @@ struct ClickWheelView: View {
                     centreHoldTask?.cancel()
                     ringHoldTask?.cancel()
                     menuHoldTask?.cancel()
+                }
+                if beganOnRing, isOnRing(value.location) {
+                    touchAngle = angle(at: value.location)
+                    if !touchVisible { touchVisible = true }
                 }
                 guard hasDragged, beganOnRing else { return }
                 guard isOnRing(value.location) else {
@@ -606,6 +600,54 @@ struct ClickWheelView: View {
         beganOnRing = false
         hasDragged = false
         tapCandidate = false
+        touchVisible = false
+    }
+
+    /// The four ring labels. They sit inside the refraction layer, so they swell
+    /// and bend as the thumb passes over them.
+    private var keyLabels: some View {
+        ZStack {
+            Text("MENU")
+                .font(.system(size: diameter * 0.046, weight: .bold, design: .rounded))
+                .modifier(KeyLabelPress(pressed: pressedZone == .menu))
+                .offset(y: -labelOffset)
+            WheelSkipGlyph(pointsLeft: true)
+                .frame(width: diameter * 0.09, height: diameter * 0.05)
+                .modifier(KeyLabelPress(pressed: pressedZone == .previous))
+                .offset(x: -labelOffset)
+            WheelSkipGlyph(pointsLeft: false)
+                .frame(width: diameter * 0.09, height: diameter * 0.05)
+                .modifier(KeyLabelPress(pressed: pressedZone == .next))
+                .offset(x: labelOffset)
+            HStack(spacing: 3) {
+                Image(systemName: "play.fill")
+                Image(systemName: "pause.fill")
+            }
+            .font(.system(size: diameter * 0.05, weight: .semibold))
+            .modifier(KeyLabelPress(pressed: pressedZone == .playPause))
+            .offset(y: labelOffset)
+        }
+    }
+
+    /// The glass ring: a faint white fill with a bright upper rim and a soft
+    /// return underneath. No live blur: this layer sits inside the press tilt,
+    /// where a glass effect renders black, and the immersive screen behind it is
+    /// already a blur of the artwork.
+    private var glassSurface: some View {
+        ZStack {
+            Circle()
+                .fill(RadialGradient(colors: [Color.white.opacity(0.16), Color.white.opacity(0)],
+                                     center: UnitPoint(x: 0.5, y: 0.1), startRadius: 0, endRadius: diameter * 0.6))
+            Circle()
+                .strokeBorder(LinearGradient(colors: [Color.white.opacity(0.62), Color.white.opacity(0.08), Color.white.opacity(0.22)],
+                                             startPoint: .top, endPoint: .bottom),
+                              lineWidth: 1.2)
+            Circle()
+                .stroke(Color.black.opacity(0.14), lineWidth: diameter * 0.012)
+                .frame(width: ringInnerRadius * 2 + 4, height: ringInnerRadius * 2 + 4)
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
@@ -640,5 +682,35 @@ private struct WheelSkipGlyph: Shape {
             path.closeSubpath()
         }
         return path
+    }
+}
+
+/// 3.1.8: the refractive arc under the thumb (`WheelLens.metal`). Only the strength
+/// animates (the arc fades in and opens out from the thumb); its angle follows the
+/// thumb directly, so it never sweeps round from where the last touch was.
+private struct WheelRefraction: ViewModifier, Animatable {
+    var diameter: CGFloat
+    var innerRadius: CGFloat
+    var angle: Double
+    var halfArc: CGFloat
+    var strength: CGFloat
+
+    var animatableData: CGFloat {
+        get { strength }
+        set { strength = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        // Furthest a sample can travel: the stretch along the outer edge of the arc.
+        let reach = diameter * 0.5 * halfArc * 0.32 + 2
+        content.layerEffect(
+            ShaderLibrary.wheelArcRefraction(.float2(diameter / 2, diameter / 2),
+                                             .float(innerRadius),
+                                             .float(diameter / 2),
+                                             .float(angle),
+                                             .float(halfArc),
+                                             .float(strength)),
+            maxSampleOffset: CGSize(width: reach, height: reach),
+            isEnabled: strength > 0.001)
     }
 }

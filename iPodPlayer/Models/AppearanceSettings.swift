@@ -6,6 +6,9 @@ enum AppThemePreset: String, CaseIterable, Identifiable {
     case midnight = "午夜黑"
     case mint = "薄荷绿"
     case sunset = "落日橙"
+    /// The iOS 6 chrome: a brushed-steel body with a bright LCD, the surface the
+    /// iPod classic was wrapped in before the palette drifted to pastel lacquer.
+    case silver = "银色"
 
     var id: String { rawValue }
 
@@ -55,6 +58,22 @@ enum AppThemePreset: String, CaseIterable, Identifiable {
                                 accent: Color(red: 0.03, green: 0.38, blue: 0.27), isDark: false,
                                 bodyHighlight: Color.white.opacity(0.34),
                                 bodyShade: Color(red: 0.06, green: 0.30, blue: 0.22).opacity(0.16))
+        case .silver:
+            return ThemePalette(screenBackground: Color(red: 0.93, green: 0.94, blue: 0.96),
+                                lcdBackground: Color(red: 0.965, green: 0.975, blue: 0.985),
+                                headerTop: Color(red: 0.99, green: 1, blue: 1),
+                                headerBottom: Color(red: 0.80, green: 0.83, blue: 0.87),
+                                headerDivider: Color(red: 0.55, green: 0.58, blue: 0.62),
+                                footerBackground: Color(red: 0.90, green: 0.91, blue: 0.93),
+                                footerDivider: Color(red: 0.75, green: 0.78, blue: 0.81),
+                                barBackground: Color(red: 0.86, green: 0.88, blue: 0.90),
+                                backgroundTop: Color(red: 0.88, green: 0.90, blue: 0.93),
+                                backgroundBottom: Color(red: 0.55, green: 0.59, blue: 0.64),
+                                bodyBackground: Color(red: 0.70, green: 0.73, blue: 0.77),
+                                wheelTint: Color(red: 0.52, green: 0.56, blue: 0.61),
+                                accent: Color(red: 0.05, green: 0.33, blue: 0.68), isDark: false,
+                                bodyHighlight: Color.white.opacity(0.40),
+                                bodyShade: Color(red: 0.16, green: 0.19, blue: 0.24).opacity(0.18))
         case .sunset:
             return ThemePalette(screenBackground: Color(red: 1, green: 0.94, blue: 0.86),
                                 lcdBackground: Color(red: 1, green: 0.96, blue: 0.90),
@@ -120,8 +139,15 @@ struct ThemePalette {
     /// The selection bar is deliberately theme-independent: it is the hardware's
     /// own highlight (the classic iPod blue), not a brand colour of the theme, so
     /// it must not swing when the user picks 薄荷绿 or 落日橙.
-    var selectionTop: Color { Color(red: 0.863, green: 0.902, blue: 0.949) }
-    var selectionBottom: Color { Color(red: 0.761, green: 0.824, blue: 0.894) }
+    ///
+    /// 3.1: the bar is a saturated blue glass lens with white ink (iOS 26 tint
+    /// strength), no longer the pale LCD blue with black ink.
+    var selectionTop: Color { Color(red: 0.290, green: 0.576, blue: 0.984) }
+    var selectionBottom: Color { Color(red: 0.098, green: 0.365, blue: 0.831) }
+    /// Ink on the selection lens. Every row reads these instead of a hard-coded
+    /// colour, so the lens and its text can only change together.
+    var selectionInk: Color { .white }
+    var selectionSecondaryInk: Color { Color.white.opacity(0.88) }
 }
 
 /// One set of numbers for the whole LCD. A list row, a settings row, a search row
@@ -151,9 +177,9 @@ enum Metrics {
     /// The selection lens (see `LCDSelectionBar`). Concentric with the panel: the
     /// panel's radius is the device's minus `panelInset`, and the lens sits a few
     /// points inside it. All three at 0 restores the full-bleed classic bar.
-    static let selectionInset: CGFloat = 4
+    static let selectionInset: CGFloat = 6
     static let selectionVerticalInset: CGFloat = 2
-    static let selectionRadius: CGFloat = 12
+    static let selectionRadius: CGFloat = 20
 
     /// The Now Playing cover is the one large cover on the device, so it takes a
     /// larger radius than the 8pt small covers. `artworkGlowOpacity` is the cover's
@@ -170,13 +196,17 @@ enum AppFont {
     static let hero = Font.system(size: 22, weight: .bold)
     /// A selected row's primary line.
     static let title = Font.system(size: 19, weight: .semibold)
-    /// An LCD screen title.
-    static let header = Font.system(size: 15, weight: .bold)
+    /// An LCD screen title. Rounded since 3.1.9: a quiet nod to the classic iPod
+    /// screen, matching the wheel's MENU label. Rows stay in regular SF for
+    /// legibility on glass. Chinese falls back to PingFang (it has no rounded cut).
+    static let header = Font.system(size: 15, weight: .bold, design: .rounded)
     static let body = Font.system(size: 15)
     static let detail = Font.system(size: 13)
     static let caption = Font.system(size: 12)
     static let micro = Font.system(size: 11, weight: .semibold)
     static let microRegular = Font.system(size: 11)
+    /// The fast-scroll letter bubble (`LCDFastScrollIndex`), rounded like the title strip.
+    static let indexBubble = Font.system(size: 52, weight: .bold, design: .rounded)
 }
 
 @MainActor
@@ -187,6 +217,10 @@ final class AppearanceSettings: ObservableObject {
     }
     @AppStorage("appearanceEffectiveTheme") private var savedEffectiveTheme = AppThemePreset.classic.rawValue
     @Published private(set) var systemColorScheme: ColorScheme = .light
+    /// Now Playing as a full-bleed screen with a clear-glass wheel over the artwork.
+    @AppStorage("immersiveNowPlaying") var immersiveNowPlaying = false {
+        willSet { objectWillChange.send() }
+    }
     @Published var selectedTheme: AppThemePreset {
         didSet {
             UserDefaults.standard.set(selectedTheme.rawValue, forKey: "appearanceTheme")
