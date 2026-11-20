@@ -1,13 +1,31 @@
 import SwiftUI
 import UIKit
 
+/// 3.2.19: the normal ↔ immersive switch, one curve for the whole change.
+///
+/// 3.2.10 gave the page a curve that is already moving in its first frame, so a
+/// hold answers immediately. The wheel's lacquer ↔ glass turn kept the old
+/// `easeInOut(duration: 0.4)`: an ease-in-out leaving rest has no slope at all,
+/// so through the first 100 ms it had moved under 2 % while the page was past
+/// two thirds — the disc still looked like lacquer, which read as the wheel
+/// starting a beat after everything else. The wheel now rides the page's curve,
+/// so the two begin and land together. Leaving the immersive page is the same
+/// switch and gets the same timing.
+enum ImmersiveSwitchPace {
+    /// Fast off the mark (first frame ≈ 17 %), long settle, no overshoot.
+    static let move = Animation.timingCurve(0.2, 0.8, 0.25, 1, duration: 0.4)
+}
+
 /// One touch surface arbitrates ring rotation and all five key taps. Labels
 /// never intercept a drag, and a drag can never become a button tap on release.
 @MainActor
 struct ClickWheelView: View {
     let diameter: CGFloat
     let isPlaying: Bool
-    let canToggleLike: Bool
+    /// 3.1.15: asked only by the VoiceOver representation. Passed as a closure so
+    /// the parent no longer reads the selection to build this view: as a plain Bool
+    /// it made `ContentView` itself depend on `selectedIndex` and re-run on every step.
+    let canToggleLike: () -> Bool
     let onStep: (Int) -> Bool
     let onRotationEnded: () -> Void
     let onMenu: () -> Void
@@ -19,6 +37,10 @@ struct ClickWheelView: View {
     let onSeekBackward: (Double) -> Void
     let onConfirm: () -> Void
     let onConfirmLongPress: () -> Bool
+    /// 3.2: on Now Playing, holding the play/pause key switches the immersive
+    /// screen on and off. nil elsewhere: no hold starts, the key only plays/pauses.
+    /// Returns false when the hold did nothing, so no haptic is given.
+    var onPlayPauseLongPress: (() -> Bool)? = nil
     /// Clear glass instead of the lacquered ring: the immersive Now Playing lays the
     /// wheel over the artwork. Geometry, keys and gestures are the same.
     var glass: Bool = false
@@ -38,6 +60,7 @@ struct ClickWheelView: View {
     @State private var centreHoldTask: Task<Void, Never>?
     @State private var ringHoldTask: Task<Void, Never>?
     @State private var menuHoldTask: Task<Void, Never>?
+    @State private var playHoldTask: Task<Void, Never>?
     @State private var longPressFired = false
     /// Where the thumb is on the ring (radians, as `angle(at:)` measures), and
     /// whether the refraction that follows it is showing.
@@ -61,6 +84,10 @@ struct ClickWheelView: View {
     /// 3.1.8: half the length of the refractive arc under the thumb, in radians
     /// (0.8 ≈ 46° each side, so the arc covers about a quarter of the wheel).
     private static let refractionHalfArc: CGFloat = 0.8
+    /// 3.2.3: how long any key must be held before its hold action fires — MENU,
+    /// centre, play/pause and the seek keys all share it, so every hold feels the
+    /// same. Was 0.55 s.
+    private static let holdDelay: UInt64 = 750_000_000
 
     var body: some View {
         ZStack {
@@ -101,7 +128,10 @@ struct ClickWheelView: View {
             // geometry they always did.
             .rotation3DEffect(.degrees(pressTilt.x), axis: (x: 1, y: 0, z: 0), perspective: 0.5)
             .rotation3DEffect(.degrees(pressTilt.y), axis: (x: 0, y: 1, z: 0), perspective: 0.5)
-            .animation(.spring(response: 0.24, dampingFraction: 0.72), value: pressedZone)
+            // All four ring keys sink with the light, then spring back on release.
+            .animation(pressedZone == nil
+                       ? .spring(response: 0.24, dampingFraction: 0.72)
+                       : .easeOut(duration: 0.10), value: pressedZone)
 
             centreButton
         }
@@ -135,11 +165,15 @@ struct ClickWheelView: View {
                 Button("返回主菜单", action: onMenuLongPress)
                 Button("上一首", action: onPrevious)
                 Button("确认", action: onConfirm)
-                if canToggleLike {
+                if canToggleLike() {
                     Button("喜欢 / 取消喜欢") { _ = onConfirmLongPress() }
                 }
                 Button("下一首", action: onNext)
                 Button(isPlaying ? "暂停" : "播放", action: onPlayPause)
+                    .accessibilityHint("长按进入或退出沉浸式播放页")
+                if let onPlayPauseLongPress {
+                    Button("沉浸式播放页") { _ = onPlayPauseLongPress() }
+                }
             }
         }
     }
@@ -349,9 +383,14 @@ struct ClickWheelView: View {
                         x: diameter * (pressed ? 0.003 : 0.007),
                         y: diameter * (pressed ? 0.008 : 0.019))
 
-            if glass {
-                Circle().fill(Color.white.opacity(pressed ? 0.26 : 0.18))
-            } else {
+            // Both faces stay mounted and cross-fade by opacity. As an `if / else`,
+            // the themed face was gone on the very frame the wheel turned to glass
+            // (measured: the key went from white to near black in one frame, ahead
+            // of everything else on screen, then climbed back to grey), so the bare
+            // black silhouette under it flashed as a dark ball. Holding play/pause
+            // on the regular Now Playing is what turns the wheel to glass under the
+            // thumb, so that hold alone had a flash the other keys' holds lack.
+            ZStack {
                 // 3.1.5: the same glass as the ring, a little brighter, since it
                 // stands proud of the disc. Pressed, it dims a touch.
                 Circle().fill(appearance.theme.bodyBackground)
@@ -361,6 +400,9 @@ struct ClickWheelView: View {
                 Circle().fill(appearance.theme.wheelTint.opacity(darkFace ? 0.05 : 0.10))
                 Circle().fill(Color.black.opacity(pressed ? (darkFace ? 0.14 : 0.07) : 0))
             }
+            .opacity(glass ? 0 : 1)
+            Circle().fill(Color.white.opacity(pressed ? 0.26 : 0.18))
+                .opacity(glass ? 1 : 0)
             if !reduceTransparency {
                 // A domed face: the light pools softly on the upper left. Under the glass,
                 // so the lens edge refracts it.
@@ -417,12 +459,19 @@ struct ClickWheelView: View {
                     pressedZone = startZone
                     tapCandidate = startZone != nil
                     beganOnRing = isOnRing(value.startLocation)
-                    HapticEngine.shared.prepare()
                     if startZone == .confirm { beginCentreHold() }
                     if let ringZone = startZone, ringZone != .confirm { beginRingHold(in: ringZone) }
                     if startZone == .menu { beginMenuHold() }
+                    if startZone == .playPause { beginPlayPauseHold() }
                     if beganOnRing {
                         _ = tracker.update(angle: angle(at: value.startLocation), timestamp: now)
+                    }
+                    // Starting the haptic engine can take longer than one display
+                    // frame. Let the press render first, then warm it before the
+                    // shortest tap can finish.
+                    Task { @MainActor in
+                        await Task.yield()
+                        HapticEngine.shared.prepare()
                     }
                 }
 
@@ -433,6 +482,7 @@ struct ClickWheelView: View {
                 if zone(at: value.location) != startZone {
                     ringHoldTask?.cancel()
                     menuHoldTask?.cancel()
+                    playHoldTask?.cancel()
                 }
                 if distance > 8 {
                     hasDragged = true
@@ -441,6 +491,7 @@ struct ClickWheelView: View {
                     centreHoldTask?.cancel()
                     ringHoldTask?.cancel()
                     menuHoldTask?.cancel()
+                    playHoldTask?.cancel()
                 }
                 if beganOnRing, isOnRing(value.location) {
                     touchAngle = angle(at: value.location)
@@ -484,7 +535,7 @@ struct ClickWheelView: View {
     private func beginCentreHold() {
         centreHoldTask?.cancel()
         centreHoldTask = Task { @MainActor in
-            do { try await Task.sleep(nanoseconds: 550_000_000) }
+            do { try await Task.sleep(nanoseconds: Self.holdDelay) }
             catch { return }
             guard !Task.isCancelled, scenePhase == .active,
                   startZone == .confirm, tapCandidate, !hasDragged, !longPressFired else { return }
@@ -503,7 +554,7 @@ struct ClickWheelView: View {
     private func beginMenuHold() {
         menuHoldTask?.cancel()
         menuHoldTask = Task { @MainActor in
-            do { try await Task.sleep(nanoseconds: 550_000_000) }
+            do { try await Task.sleep(nanoseconds: Self.holdDelay) }
             catch { return }
             guard !Task.isCancelled, scenePhase == .active,
                   startZone == .menu, tapCandidate, !hasDragged, !longPressFired else { return }
@@ -514,11 +565,33 @@ struct ClickWheelView: View {
         }
     }
 
+    /// 3.2: play/pause held down toggles the immersive Now Playing (only offered
+    /// on Now Playing). Same timing and cancellation rules as
+    /// MENU's hold: a drag, leaving the key or a second finger stops it, and a hold
+    /// that fired never also plays or pauses on release.
+    private func beginPlayPauseHold() {
+        guard let onPlayPauseLongPress else { return }
+        playHoldTask?.cancel()
+        playHoldTask = Task { @MainActor in
+            do { try await Task.sleep(nanoseconds: Self.holdDelay) }
+            catch { return }
+            guard !Task.isCancelled, scenePhase == .active,
+                  startZone == .playPause, tapCandidate, !hasDragged, !longPressFired else { return }
+            longPressFired = true
+            tapCandidate = false
+            // Same feel as MENU's hold: the haptic alone. (A tap's click sound on
+            // top made this one key feel different from the others.)
+            if onPlayPauseLongPress() {
+                HapticEngine.shared.tick()
+            }
+        }
+    }
+
     private func beginRingHold(in zone: KeyZone) {
         guard zone == .previous || zone == .next else { return }
         ringHoldTask?.cancel()
         ringHoldTask = Task { @MainActor in
-            do { try await Task.sleep(nanoseconds: 550_000_000) }
+            do { try await Task.sleep(nanoseconds: Self.holdDelay) }
             catch { return }
             guard !Task.isCancelled, scenePhase == .active,
                   startZone == zone, tapCandidate, !hasDragged, !longPressFired else { return }
@@ -592,6 +665,8 @@ struct ClickWheelView: View {
         ringHoldTask = nil
         menuHoldTask?.cancel()
         menuHoldTask = nil
+        playHoldTask?.cancel()
+        playHoldTask = nil
         longPressFired = false
         tracker.reset()
         startLocation = nil

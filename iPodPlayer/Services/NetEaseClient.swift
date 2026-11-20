@@ -198,16 +198,25 @@ final class NetEaseClient {
     /// Parsed responses and prefetched addresses are rebuildable, so under memory
     /// pressure they are the first thing to give up. A background player that the
     /// system kills for memory looks exactly like a playback interruption.
+    ///
+    /// 3.1.15: going to the background is not memory pressure for this app — it is
+    /// where it spends most of its time, playing on a locked phone. Dropping the
+    /// prefetched next-song address there made the first track change after every
+    /// lock a cold lookup, in the background, exactly where a -460 hurts most. The
+    /// background transition now gives up only the parsed list responses (the big
+    /// part); the one-song address cache and the per-song cooldowns stay.
     private func observeMemoryPressure() {
         let center = NotificationCenter.default
-        for name in [UIApplication.didReceiveMemoryWarningNotification,
-                     UIApplication.didEnterBackgroundNotification] {
-            memoryNotifications.append(center.addObserver(
-                forName: name, object: nil, queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor [weak self] in self?.invalidateTransientCaches() }
-            })
-        }
+        memoryNotifications.append(center.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.invalidateTransientCaches() }
+        })
+        memoryNotifications.append(center.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.invalidateResponseCache() }
+        })
     }
 
     private func invalidateTransientCaches() {
@@ -414,6 +423,22 @@ final class NetEaseClient {
         return tracks
     }
 
+    /// 3.2: the song's timed lyrics and NetEase's translation of them, for the
+    /// immersive Now Playing. Not cached here: `LyricsStore` keeps the parsed lines.
+    func lyric(trackID: String) async throws -> NetEaseLyricPayload {
+        let body = try await request("/lyric", parameters: ["id": trackID], timeout: 10)
+        func text(_ key: String) -> String? {
+            guard let value = (body[key] as? [String: Any])?["lyric"] as? String,
+                  !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return value
+        }
+        func flag(_ key: String) -> Bool {
+            (body[key] as? NSNumber)?.boolValue ?? (body[key] as? Bool) ?? false
+        }
+        return NetEaseLyricPayload(lyric: text("lrc"), translation: text("tlyric"),
+                                   isInstrumental: flag("nolyric") || flag("pureMusic"))
+    }
+
     func playbackTrack(_ track: Track) async throws -> Track {
         guard track.source == .netease else { throw ClientError.message("请选择网易云歌曲。") }
         playbackPriorityDepth += 1
@@ -463,6 +488,13 @@ final class NetEaseClient {
     /// Resolves the next song's address while the current one is still playing. A
     /// failure here is discarded on purpose: the track change asks again through the
     /// normal path, where an error is expected to be shown and counted.
+    /// 3.2.8: true while the service is refusing this caller (-460): optional,
+    /// look-ahead requests (the next song's lyrics) wait it out.
+    var isSpeculationMuted: Bool {
+        if let quietUntil = riskControlQuietUntil, quietUntil > Date() { return true }
+        return false
+    }
+
     func prefetchPlaybackTrack(_ track: Track) async {
         guard track.source == .netease else { return }
         // Speculative work is the first thing to give up when the service has already

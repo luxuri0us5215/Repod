@@ -3,7 +3,13 @@ import Security
 
 /// This Keychain item contains Spotify OAuth tokens only. Configuration stays in UserDefaults.
 enum TokenKeychain {
-    private static let service = "com.qiuhaoyu.ipodplayer.spotify.tokens"
+    /// Keychain items are named after the app's own bundle id, so a fork built with a
+    /// different identifier keeps its credentials to itself. The service suffix is part
+    /// of the stored item name: changing the bundle id of an existing install means
+    /// logging in once more.
+    private static var service: String {
+        (Bundle.main.bundleIdentifier ?? "repod") + ".spotify.tokens"
+    }
     private static let account = "oauth"
 
     static func read() throws -> Data? {
@@ -52,7 +58,9 @@ enum TokenKeychain {
 
 /// The cookie and its server binding share one device-only Keychain item.
 enum NetEaseCookieKeychain {
-    private static let service = "com.qiuhaoyu.ipodplayer.netease.session"
+    private static var service: String {
+        (Bundle.main.bundleIdentifier ?? "repod") + ".netease.session"
+    }
     private static let account = "cookie"
 
     private struct StoredSession: Codable {

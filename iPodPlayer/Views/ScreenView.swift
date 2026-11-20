@@ -5,6 +5,8 @@ import UIKit
 struct ScreenView: View {
     let viewModel: PlayerViewModel
     var safeTop: CGFloat = 0
+    /// False while the immersive Now Playing covers this (faded-out) screen.
+    var nowPlayingEffectsActive: Bool = true
     @EnvironmentObject private var appearance: AppearanceSettings
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// The stack depth as of the last screen this view drew. In the update where
@@ -12,12 +14,13 @@ struct ScreenView: View {
     /// which way that navigation went: a push slides in from the right, MENU slides
     /// back in from the left.
     @State private var lastDepth = 1
-    private var navigatesForward: Bool { viewModel.navigation.count >= lastDepth }
+    private var navigatesForward: Bool { viewModel.navigationDepth >= lastDepth }
 
     var body: some View {
         ZStack {
             if viewModel.currentScreen == .nowPlaying {
-                NowPlayingView(viewModel: viewModel, clock: viewModel.clock, safeTop: safeTop)
+                NowPlayingView(viewModel: viewModel, clock: viewModel.clock, safeTop: safeTop,
+                               effectsActive: nowPlayingEffectsActive)
                     .background(AppThemePreset.midnight.palette.lcdBackground)
                     .modifier(ScreenEntryMotion(scale: reduceMotion ? 1 : 1.04))
             } else {
@@ -36,7 +39,7 @@ struct ScreenView: View {
         // inside (lens glide, Now Playing drift, switches) runs as before.
         .transaction(value: viewModel.currentScreen) { $0.animation = nil }
         .environment(\.locale, Locale(identifier: viewModel.language.rawValue))
-        .onChange(of: viewModel.navigation.count) { _, new in
+        .onChange(of: viewModel.navigationDepth) { _, new in
             lastDepth = new
         }
     }
@@ -83,7 +86,7 @@ struct ScreenView: View {
         case .home:
             homeSplit
         default:
-            menu
+            LCDMenuList(viewModel: viewModel)
         }
     }
 
@@ -93,7 +96,7 @@ struct ScreenView: View {
     private var homeSplit: some View {
         GeometryReader { geometry in
             HStack(spacing: 0) {
-                menu
+                LCDMenuList(viewModel: viewModel)
                     .frame(width: (geometry.size.width * 0.55).rounded())
                 HomePreviewPane(viewModel: viewModel)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -176,20 +179,38 @@ struct ScreenView: View {
         }
         .shadow(color: .black.opacity(appearance.theme.isDark ? 0.30 : 0.08), radius: 6, y: 3)
     }
+}
 
-    private var menu: some View {
+/// The plain LCD menu (every list that is not songs, search, settings or the
+/// source switcher).
+///
+/// 3.1.15: its own view. As a property of `ScreenView` it made the wheel — which
+/// moves `selectedIndex` on every step — re-run the whole screen's body (title
+/// strip, footer, the screen switch) for each step, and every pass copied the
+/// entries into an `enumerated()` array. Now only this list repaints on a step,
+/// and the rows are iterated in place.
+@MainActor
+private struct LCDMenuList: View {
+    let viewModel: PlayerViewModel
+    @EnvironmentObject private var appearance: AppearanceSettings
+
+    var body: some View {
         // `menuEntries` and `selectedIndex` each rebuild the whole list. Read once per
         // pass: per row, an artist or album list cost N rebuilds of N entries.
         let entries = viewModel.menuEntries
         let selectedIndex = viewModel.selectedIndex
+        let selectedID = entries.indices.contains(selectedIndex) ? entries[selectedIndex].id : nil
         return ScrollViewReader { proxy in
             ScrollView(.vertical) {
                 LazyVStack(spacing: 0) {
-                    ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
+                    ForEach(entries) { entry in
                         Button {
-                            viewModel.selectMenuEntry(at: index)
+                            // Located on tap only, so a step never walks the list.
+                            if let index = entries.firstIndex(where: { $0.id == entry.id }) {
+                                viewModel.selectMenuEntry(at: index)
+                            }
                         } label: {
-                            menuRow(entry, selected: index == selectedIndex)
+                            menuRow(entry, selected: entry.id == selectedID)
                         }
                         .buttonStyle(LCDPressFeedbackStyle())
                         .id(entry.id)
@@ -203,17 +224,24 @@ struct ScreenView: View {
                 .lcdLensHost()
             }
             .scrollIndicators(.hidden)
+            // 3.2.22: iOS 18+ follows the wheel by itself; the calls below are the
+            // iOS 17 path.
+            .lcdWheelFollow(selectedID.map { AnyHashable($0) })
             .lcdEdgeFade(appearance.theme.lcdBackground)
-            .modifier(LCDFastScrollIndex(selectedIndex: selectedIndex, count: entries.count) { index in
+            .modifier(LCDFastScrollIndex(selectedIndex: selectedIndex, count: entries.count,
+                                         showsIndex: viewModel.currentScreen.isAlphabeticalList) { index in
                 entries.indices.contains(index) ? LCDFastScrollIndex.indexLetter(entries[index].title) : nil
             })
             .onChange(of: selectedIndex) { _, index in
+                guard !LCDWheelFollow.isActive else { return }
                 scrollToEntry(at: index, in: entries, proxy: proxy, animated: true)
             }
             .onChange(of: viewModel.currentScreen) { _, _ in
+                guard !LCDWheelFollow.isActive else { return }
                 scrollToEntry(at: selectedIndex, in: entries, proxy: proxy)
             }
             .onAppear {
+                guard !LCDWheelFollow.isActive else { return }
                 scrollToEntry(at: selectedIndex, in: entries, proxy: proxy)
             }
         }
@@ -232,10 +260,11 @@ struct ScreenView: View {
                 // MenuEntry already holds display text, localized at construction.
                 Text(verbatim: entry.title)
                     .font(AppFont.title)
+                    .lcdSelectionInk(selected)
                 if let detail = entry.detail {
                     Text(verbatim: detail)
                         .font(AppFont.detail)
-                        .foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText)
+                        .lcdSelectionInk(selected, secondary: true)
                 }
             }
             .lineLimit(1)
@@ -244,18 +273,19 @@ struct ScreenView: View {
                 LCDSlideLock(isOn: switchValue)
             } else if entry.marked {
                 Image(systemName: "checkmark").font(.system(size: 14, weight: .bold))
+                    .lcdSelectionInk(selected)
             } else if entry.showsChevron {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText)
+                    .lcdSelectionInk(selected, secondary: true)
             }
         }
         .padding(.horizontal, Metrics.horizontalInset)
         // One rule for every LCD row: a subtitle makes the row 60pt, otherwise 50pt.
         .frame(height: entry.detail == nil ? Metrics.singleLineRowHeight : Metrics.doubleLineRowHeight)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .foregroundStyle(selected ? appearance.theme.selectionInk : appearance.theme.lcdText)
-        .lcdSelectionBackground(selected)
+        .foregroundStyle(appearance.theme.lcdText)
+        .lcdSelectionBackground(selected, id: AnyHashable(entry.id))
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? [.isSelected] : [])
@@ -587,6 +617,11 @@ struct LCDEmptyState: View {
 struct LCDFastScrollIndex: ViewModifier {
     let selectedIndex: Int
     let count: Int
+    /// Only a list that is sorted by name gets the bubble. On a list in playback
+    /// order — an album's track numbers, a playlist's own order, Personal FM —
+    /// the letter says nothing about where the row is, and it covered the rows
+    /// the user was trying to scan.
+    var showsIndex: Bool = true
     let label: (Int) -> String?
     @EnvironmentObject private var appearance: AppearanceSettings
     @State private var stamps: [TimeInterval] = []
@@ -617,7 +652,7 @@ struct LCDFastScrollIndex: ViewModifier {
     }
 
     private func noteStep(at index: Int) {
-        guard count >= Self.minimumCount else { return }
+        guard showsIndex, count >= Self.minimumCount else { return }
         let now = ProcessInfo.processInfo.systemUptime
         stamps = (stamps + [now]).filter { now - $0 < Self.window }
         guard stamps.count >= Self.stepsToShow || letter != nil,
@@ -646,10 +681,18 @@ struct LCDFastScrollIndex: ViewModifier {
     }
 
     /// The index letter for a row title: its first letter or digit, upper-cased.
-    /// A Chinese title shows its first character.
+    /// A title written in another script is shown by the first letter of its
+    /// romanisation — 周 → Z, あ → A — because that is the order the list is in;
+    /// the character itself only said "you are in the Chinese part".
     static func indexLetter(_ title: String) -> String? {
         guard let first = title.first(where: { $0.isLetter || $0.isNumber }) else { return nil }
-        return String(first).uppercased()
+        if first.isASCII { return String(first).uppercased() }
+        guard let latin = String(first)
+            .applyingTransform(.toLatin, reverse: false)?
+            .applyingTransform(.stripDiacritics, reverse: false),
+            let head = latin.first(where: { $0.isASCII && ($0.isLetter || $0.isNumber) })
+        else { return nil }
+        return String(head).uppercased()
     }
 }
 
@@ -703,6 +746,8 @@ struct HomePreviewPane: View {
             VStack(spacing: Layout.captionGap) {
                 card(kind, side: side)
                     .frame(width: side, height: side)
+                    // 3.2.5: the immersive page opens out of this card.
+                    .immersiveEntranceAnchor("cover", enabled: kind == .nowPlaying)
                     .clipShape(RoundedRectangle(cornerRadius: Layout.cardRadius, style: .continuous))
                     .overlay {
                         RoundedRectangle(cornerRadius: Layout.cardRadius, style: .continuous)
@@ -857,10 +902,12 @@ struct HomePreviewPane: View {
             Text(verbatim: lines.0)
                 .font(AppFont.detail.weight(.semibold))
                 .foregroundStyle(theme.lcdText)
+                .immersiveEntranceAnchor("title", enabled: kind == .nowPlaying)
             if let detail = lines.1, !detail.isEmpty {
                 Text(verbatim: detail)
                     .font(AppFont.caption)
                     .foregroundStyle(theme.lcdSecondaryText)
+                    .immersiveEntranceAnchor("artist", enabled: kind == .nowPlaying)
             }
         }
         .lineLimit(1)

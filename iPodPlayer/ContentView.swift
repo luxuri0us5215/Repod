@@ -15,6 +15,10 @@ struct ContentView: View {
     @StateObject private var holder = PlayerViewModelHolder()
     private var viewModel: PlayerViewModel { holder.viewModel }
     @StateObject private var appearance = AppearanceSettings()
+    @Namespace private var heroSpace
+    /// 3.2.5: where Home's preview card last showed the Now Playing cover / title /
+    /// artist; the immersive page opens out of them when entered from Home.
+    @State private var homeNowPlayingAnchors: [String: CGRect] = [:]
     /// The boot lock screen owns its own dismissal: it stays up until the unlock
     /// animation ends, not merely until the library is ready.
     @State private var showsBoot = true
@@ -57,6 +61,32 @@ struct ContentView: View {
         false
         #endif
     }
+
+    /// 3.2: on Now Playing, holding play/pause switches between the LCD screen and
+    /// the immersive one. It flips the same switch as Settings → Appearance →
+    /// Immersive Now Playing, so the two never disagree. Not offered on other
+    /// screens (the wheel gets no hold action there).
+    private func toggleImmersiveShortcut() -> Bool {
+        guard viewModel.currentScreen == .nowPlaying else { return false }
+        // One transaction for the whole switch: the shared elements' flight, both
+        // pages' fades and the page-only elements' slides all ride this curve.
+        withAnimation(Self.move) { appearance.immersiveNowPlaying.toggle() }
+        return true
+    }
+
+    /// The normal ↔ immersive movement: off the mark at once, then a long settle,
+    /// and no overshoot — every element glides straight to its place and stops.
+    ///
+    /// 3.2.10: this was a 0.55 s critically damped spring. A spring leaves rest at
+    /// zero speed, so for the first three or four frames the page had moved by
+    /// only a few percent: holding the play key looked like it answered a beat
+    /// after MENU's and the centre key's holds, which change the screen on the
+    /// very frame the hold fires. A curve that starts fast (slope ≈ 4) is visibly
+    /// in motion in the first frame and still eases into place instead of stopping.
+    ///
+    /// 3.2.19: now shared with the wheel's lacquer ↔ glass turn, so the disc starts
+    /// on the same frame as the page instead of easing in a beat behind it.
+    private static let move = ImmersiveSwitchPace.move
 
     @ViewBuilder
     private func landscapeCanvas(_ geometry: GeometryProxy) -> some View {
@@ -120,12 +150,14 @@ struct ContentView: View {
                         // spills from the LCD's lower edge onto the body.
                         ZStack {
                             if isNowPlaying, !immersive, let url = viewModel.currentTrack?.artworkURL {
-                                CachedArtwork(url: url) { image in
-                                    if let image {
-                                        image.resizable().scaledToFill()
-                                            .frame(width: geometry.size.width * 0.82, height: screenHeight * 0.5)
-                                            .clipped()
-                                            .blur(radius: 44)
+                                // 3.1.15: a pre-blurred bitmap with its own soft edge,
+                                // stretched over the glow's area, instead of a live
+                                // `.blur(44)` composited on every frame of the screen.
+                                BlurredArtwork(url: url, style: .glow) { glow in
+                                    if let glow {
+                                        glow
+                                            .frame(width: geometry.size.width * 0.82 * ArtworkBlurStyle.glowFrameScale,
+                                                   height: screenHeight * 0.5 * ArtworkBlurStyle.glowFrameScale)
                                             .saturation(1.7)
                                             .opacity(appearance.theme.isDark ? 0.42 : 0.52)
                                     }
@@ -138,17 +170,36 @@ struct ContentView: View {
                         .allowsHitTesting(false)
                         .accessibilityHidden(true)
 
-                        if immersive {
+                        // 3.2.3: mounted for as long as Now Playing is up, so switching
+                        // in and out animates a page that is already drawn. 3.2.4: on
+                        // the switch, cover / title / artist fly between their places on
+                        // the two pages (`nowPlayingHero`) while the pages cross-fade.
+                        if isNowPlaying {
                             ImmersiveNowPlayingView(viewModel: viewModel,
                                                     safeTop: safeGeometry.safeAreaInsets.top,
-                                                    wheelSpace: remainingHeight)
+                                                    wheelSpace: remainingHeight,
+                                                    wheelDiameter: wheelDiameter,
+                                                    isActive: immersive,
+                                                    lyricsEnabled: appearance.immersiveNowPlaying,
+                                                    entrance: ImmersiveEntrance(
+                                                        cover: homeNowPlayingAnchors["cover"],
+                                                        title: homeNowPlayingAnchors["title"],
+                                                        artist: homeNowPlayingAnchors["artist"]))
                                 .ignoresSafeArea()
-                                .transition(.opacity)
+                                .opacity(immersive ? 1 : 0)
+                                .allowsHitTesting(immersive)
+                                .accessibilityHidden(!immersive)
+                                // 3.2.5: arriving with the setting on, the page is there at
+                                // once and its parts make their own entrance (no page fade,
+                                // which showed the body through it). Leaving with MENU: fade.
+                                .transition(.asymmetric(insertion: .identity,
+                                                        removal: .opacity.animation(.easeOut(duration: 0.2))))
                         }
 
                         VStack(spacing: 0) {
                             let screenRadius = panelCornerRadius - bezel
-                            ScreenView(viewModel: viewModel, safeTop: max(0, safeGeometry.safeAreaInsets.top - 12 - bezel))
+                            ScreenView(viewModel: viewModel, safeTop: max(0, safeGeometry.safeAreaInsets.top - 12 - bezel),
+                                       nowPlayingEffectsActive: !immersive)
                                 .frame(width: (geometry.size.width - Metrics.panelInset * 2 - bezel * 2).rounded(),
                                        height: (screenHeight - Metrics.panelInset - bezel * 2).rounded())
                                 .clipShape(RoundedRectangle(cornerRadius: screenRadius, style: .continuous))
@@ -175,6 +226,8 @@ struct ContentView: View {
                                 .frame(width: geometry.size.width, height: screenHeight)
                                 // Immersive: the LCD steps aside but keeps its place, so
                                 // the wheel does not move.
+                                // 3.2.4: it cross-fades with the immersive page while the
+                                // shared cover, title and artist fly between the two.
                                 .opacity(immersive ? 0 : 1)
                                 .allowsHitTesting(!immersive)
                                 .accessibilityHidden(immersive)
@@ -182,7 +235,7 @@ struct ContentView: View {
                             ClickWheelView(
                                 diameter: wheelDiameter,
                                 isPlaying: viewModel.isPlaying,
-                                canToggleLike: viewModel.canToggleTrackLike,
+                                canToggleLike: { viewModel.canToggleTrackLike },
                                 onStep: { direction in
                                     let moved = viewModel.handleWheelRotation(by: direction)
                                     // 3.1.5: turning the wheel means browsing, not typing.
@@ -207,15 +260,26 @@ struct ContentView: View {
                                 onSeekBackward: { viewModel.seekBy(seconds: -$0) },
                                 onConfirm: { viewModel.confirmSelection() },
                                 onConfirmLongPress: { viewModel.toggleSelectedTrackLike() },
+                                // Only on Now Playing: elsewhere the key keeps its plain
+                                // play/pause, with no hold to wait out.
+                                onPlayPauseLongPress: isNowPlaying ? { toggleImmersiveShortcut() } : nil,
                                 glass: immersive
                             )
+                            // The wheel turns to clear glass (and back) alongside,
+                            // on the switch's own curve (3.2.19): it used to ease
+                            // in, so the disc sat there unchanged while the page was
+                            // already a third of the way in.
+                            .animation(ImmersiveSwitchPace.move, value: immersive)
                             .frame(maxWidth: .infinity)
                             .frame(height: remainingHeight)
                         }
                     }
                 }
                 .frame(width: geometry.size.width, height: geometry.size.height)
-                .animation(.easeInOut(duration: 0.35), value: immersive)
+                // 3.2.4: the shared space for the elements that fly between the LCD
+                // Now Playing and the immersive page.
+                .environment(\.nowPlayingHero, NowPlayingHeroSpace(namespace: heroSpace, immersive: immersive))
+                .onPreferenceChange(ImmersiveEntranceKey.self) { homeNowPlayingAnchors = $0 }
                 .statusBarHidden(isLandscape || forcesLandscapeForScreenshots
                                       || viewModel.currentScreen == .nowPlaying || showsBoot)
             }

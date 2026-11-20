@@ -142,11 +142,20 @@ final class TiltDriver: ObservableObject {
 @MainActor
 struct ArtworkTilt<Content: View>: View {
     let cornerRadius: CGFloat
+    /// 3.1.15: false while the screen is hidden (the immersive Now Playing covers the
+    /// LCD copy). Motion updates then stop instead of repainting an invisible cover
+    /// 30 times a second.
+    var isActive: Bool = true
     @ViewBuilder var content: Content
 
     @StateObject private var driver = TiltDriver()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
+
+    /// One rule for every trigger below (appear, scene phase, Reduce Motion, hidden).
+    private func updateDriver() {
+        if isActive && !reduceMotion && scenePhase == .active { driver.start() } else { driver.stop() }
+    }
 
     var body: some View {
         let lean = reduceMotion ? .zero : driver.offset
@@ -163,14 +172,11 @@ struct ArtworkTilt<Content: View>: View {
             .offset(x: lean.width * ArtworkTiltMetrics.parallax,
                     y: lean.height * ArtworkTiltMetrics.parallax * 0.75)
             .animation(.interactiveSpring(response: 0.28, dampingFraction: 0.8), value: lean)
-            .onAppear { driver.start() }
+            .onAppear { updateDriver() }
             .onDisappear { driver.stop() }
-            .onChange(of: scenePhase) { _, phase in
-                if phase == .active { driver.start() } else { driver.stop() }
-            }
-            .onChange(of: reduceMotion) { _, reduced in
-                if reduced { driver.stop() } else { driver.start() }
-            }
+            .onChange(of: scenePhase) { _, _ in updateDriver() }
+            .onChange(of: reduceMotion) { _, _ in updateDriver() }
+            .onChange(of: isActive) { _, _ in updateDriver() }
     }
 
     private func specular(for lean: CGSize) -> some View {

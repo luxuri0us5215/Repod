@@ -27,6 +27,7 @@ Requires iOS 17.0+.
 
 - Click wheel: scroll with acceleration, select, menu, play/pause, previous/next, haptics throughout
 - Cover Flow album browsing in landscape, with album reflections
+- Immersive Now Playing (hold Play): artwork and scrolling lyrics on one page, in a serif face
 - Search, artists, albums, playlists, daily recommendations, personal FM, podcasts and liked songs
 - NetEase direct mode: `weapi` / `eapi` requests are signed on the device, QR login as a desktop client, play scrobbling through `clientlog`
 - Optional gateway mode for an existing NeteaseCloudMusicApi deployment
@@ -123,6 +124,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs are welcome.
 
 - **网易云音乐**：手机直接连 `music.163.com`。3.0 起**不需要任何服务器**，签名、Cookie、听歌打卡都在 App 内完成。如果你已经有自建的 [NeteaseCloudMusicApi](https://www.npmjs.com/package/NeteaseCloudMusicApi)，也可以切回网关模式。
 - **Spotify**：通过 Spotify iOS SDK 控制 Spotify App，用**你自己的** Client ID（在设置里填写）。
+
+长按播放键进入沉浸式正在播放页：封面和歌词在同一页，歌词随播放进度滚动。
 
 要求 iOS 17.0+。
 

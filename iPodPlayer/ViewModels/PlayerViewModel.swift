@@ -24,7 +24,39 @@ enum TrackTransitionDirection: Equatable {
 @MainActor
 @Observable
 final class PlayerViewModel {
-    private(set) var navigation = [NavigationFrame(screen: .home, selectedIndex: 0)]
+    /// 3.1.15: the stack is observed in two halves. As one tracked array, every wheel
+    /// step (which only moves a frame's `selectedIndex`) invalidated every body that
+    /// asked which screen is showing — `ContentView` and `ScreenView` included — so
+    /// the whole tree re-ran per step. `currentScreen` / `navigationDepth` now depend
+    /// on pushes and pops only; `selectedIndex` and `navigation` depend on both.
+    @ObservationIgnored private var navigationStorage = [NavigationFrame(screen: .home, selectedIndex: 0)]
+    /// Bumped when a screen is pushed, popped or replaced.
+    private var navigationStackVersion = 0
+    /// Bumped when any frame's selected row moves.
+    private var navigationSelectionVersion = 0
+    private(set) var navigation: [NavigationFrame] {
+        get {
+            _ = navigationStackVersion
+            _ = navigationSelectionVersion
+            return navigationStorage
+        }
+        set {
+            let old = navigationStorage
+            navigationStorage = newValue
+            let sameDepth = old.count == newValue.count
+            if !sameDepth || !zip(old, newValue).allSatisfy({ $0.screen == $1.screen }) {
+                navigationStackVersion &+= 1
+            }
+            if !sameDepth || !zip(old, newValue).allSatisfy({ $0.selectedIndex == $1.selectedIndex }) {
+                navigationSelectionVersion &+= 1
+            }
+        }
+    }
+    /// How many screens are stacked; repaints on push and pop only.
+    var navigationDepth: Int {
+        _ = navigationStackVersion
+        return navigationStorage.count
+    }
     private(set) var selectedSource: AudioSource
     private(set) var isPlaying = false {
         didSet { syncNowPlayingInfo() }
@@ -32,6 +64,8 @@ final class PlayerViewModel {
     /// Progress lives in its own observable object: at 4 Hz it would otherwise
     /// invalidate every list screen that observes this view model.
     let clock = PlaybackClock()
+    /// 3.2: the current song's lyrics, observed on their own like the clock.
+    let lyrics = LyricsStore()
     var elapsedSeconds: Double {
         get { clock.elapsedSeconds }
         set {
@@ -62,6 +96,12 @@ final class PlayerViewModel {
             if let currentTrack, currentTrack.source == .netease, currentTrack.artworkURL == nil {
                 fillMissingNetEaseArtwork(for: currentTrack)
             }
+            // 3.2.8: lyrics follow the song while the immersive page is switched on,
+            // even from a list, so Now Playing opens with them already there.
+            if currentTrack?.id != oldValue?.id || currentTrack?.source != oldValue?.source,
+               Self.lyricsWanted {
+                loadLyrics(for: currentTrack)
+            }
             syncNowPlayingInfo()
             savePlaybackState()
         }
@@ -90,9 +130,18 @@ final class PlayerViewModel {
     private(set) var libraryTracks: [AppScreen: [Track]] = [:] {
         didSet { libraryTracksVersion &+= 1 }
     }
-    private(set) var sourcePlaylists: [MusicPlaylist] = []
+    private(set) var sourcePlaylists: [MusicPlaylist] = [] {
+        didSet { sourcePlaylistsVersion &+= 1 }
+    }
+    /// 3.1.15: change stamps for the 歌单 / 播客 menu caches. Their keys used to join
+    /// every title (and 歌单 filtered and locale-sorted every playlist first) on
+    /// each read, and `selectedIndex` reads the menu several times per wheel step.
+    private var sourcePlaylistsVersion = 0
+    private var podcastShowsVersion = 0
     /// Podcast subscriptions behind the Podcasts menu. Their episodes are tracks.
-    private(set) var podcastShows: [PodcastShow] = []
+    private(set) var podcastShows: [PodcastShow] = [] {
+        didSet { podcastShowsVersion &+= 1 }
+    }
     /// 电台 is NetEase's Personal FM: an endless stream that refills itself, and
     /// the only place the app hands you music you have not picked.
     private(set) var radioTracks: [Track] = [] {
@@ -187,6 +236,12 @@ final class PlayerViewModel {
     /// Tracked although only caches compare it: a cache hit never touches the
     /// library itself, so this is the only read that ties a body to it.
     private var libraryGeneration = UUID()
+    /// 3.1.15: bumped when an off-main rebuild of the browsing index lands. The index
+    /// itself is ignored by observation (it is filled in while bodies run), so before
+    /// this a 歌曲 / 歌手 / 专辑 screen that had been handed the stale snapshot kept
+    /// drawing it until something unrelated repainted it — and the centre key then
+    /// played the row at that index in the *new* list, which could be another song.
+    private var browsingIndexVersion = 0
     @ObservationIgnored private var cachedBrowsingIndex: BrowsingIndex?
     private let streamingPlayer = StreamingPlayer()
     let volumeController = VolumeController()
@@ -199,6 +254,7 @@ final class PlayerViewModel {
     private var queue: [Track] = [] {
         didSet {
             queueVersion &+= 1
+            revalidateUpcomingPreload()
             savePlaybackState()
             syncNowPlayingInfo()
         }
@@ -264,6 +320,8 @@ final class PlayerViewModel {
     /// The trailing debounce of the snapshot write, and the values it will write.
     @ObservationIgnored private var playbackSaveTask: Task<Void, Never>?
     @ObservationIgnored private var pendingSnapshot: PlaybackSnapshot?
+    /// A full snapshot is owed; it is built from the live state when the save fires.
+    @ObservationIgnored private var playbackSnapshotPending = false
     @ObservationIgnored private var pendingProgress: PlaybackProgress?
     @ObservationIgnored private var isRestoringPlayback = false
     /// Guards against a second boot task applying the saved queue twice.
@@ -292,10 +350,9 @@ final class PlayerViewModel {
     /// the player publishes progress four times a second, and a prefetch keyed on the
     /// progress value would ask again on every tick.
     @ObservationIgnored private var prefetchedUpcomingTrackID: String?
+    /// 3.2.8: the song whose *next* song's lyrics were already asked for.
+    @ObservationIgnored private var prefetchedLyricsForTrackID: String?
     @ObservationIgnored private var playbackPrefetchTask: Task<Void, Never>?
-    /// Media addresses whose CDN host has already been opened for the next song, so a
-    /// repeated trigger does not re-open the same connection.
-    @ObservationIgnored private var warmedMediaAddresses = Set<String>()
     @ObservationIgnored private var sourcePlaybackStates: [AudioSource: SourcePlaybackState] = [:]
     @ObservationIgnored private var likedChecksInFlight: [String: UUID] = [:]
     @ObservationIgnored private var remoteCommandHandlers: [(command: MPRemoteCommand, token: Any)] = []
@@ -522,14 +579,20 @@ final class PlayerViewModel {
             let screen = AppScreen.podcastEpisodes(id: "fixture-show", name: "产品笔记")
             let titles = ["第一集 · 把 iPod 装进手机", "第二集 · 转盘的手感", "第三集 · 液态玻璃",
                           "第四集 · 封面流动", "第五集 · 主题的边界", "第六集 · 从 2.0 到 3.0"]
-            libraryTracks[screen] = titles.enumerated().map { index, title in
-                Track(id: "fixture-episode-\(index)", title: title, artist: "Repod 电台",
-                      album: "05 \(index + 1) 期", duration: 1_500 + Double(index) * 60,
-                      source: .netease)
+            // `REPOD_FIXTURE_COUNT=40` makes it a long list, for checking how the
+            // list follows the wheel.
+            let count = max(Int(env["REPOD_FIXTURE_COUNT"] ?? "") ?? titles.count, 1)
+            libraryTracks[screen] = (0..<count).map { index in
+                let title = index < titles.count ? titles[index] : "第 \(index + 1) 集 · 列表跟随"
+                return Track(id: "fixture-episode-\(index)", title: title, artist: "Repod 电台",
+                             album: "05 \(index + 1) 期", duration: 1_500 + Double(index) * 60,
+                             source: .netease)
             }
+            // `REPOD_FIXTURE_SELECTED=2990` opens it on that row.
+            let selected = min(max(Int(env["REPOD_FIXTURE_SELECTED"] ?? "") ?? 0, 0), count - 1)
             navigation = [home,
                           NavigationFrame(screen: .music, selectedIndex: 0),
-                          NavigationFrame(screen: screen, selectedIndex: 0)]
+                          NavigationFrame(screen: screen, selectedIndex: selected)]
         default:
             return
         }
@@ -558,16 +621,34 @@ final class PlayerViewModel {
         }.value
         guard libraryGeneration == generation, selectedSource == source else { return }
         cachedBrowsingIndex = index
+        // Written from this task, never from a body, so it is safe to publish: every
+        // screen that read the stale snapshot draws the fresh one exactly once.
+        browsingIndexVersion &+= 1
     }
 
     /// Captures the current state and schedules the write. A track change reaches this
     /// four times (the assignment, the explicit save, the resolved metadata copy and
     /// the first playing callback), so the write is trailing-debounced by one second
     /// and encoded off the main actor.
+    ///
+    /// 3.1.15: the snapshot itself is built when the debounce fires, not here. Each of
+    /// those four calls used to copy up to 400 tracks into `PersistedTrack`s on the
+    /// main thread during the transition, and three of the four copies were thrown
+    /// away by the next call. The gates that decide *whether* to save stay here,
+    /// evaluated at call time as before.
     private func savePlaybackState() {
-        guard let snapshot = makePlaybackSnapshot() else { return }
-        let progress = currentPlaybackProgress()
-        schedulePlaybackSave(snapshot: snapshot, progress: progress)
+        guard isPlaybackRestoreFinished, !isRestoringPlayback, !isApplyingArtworkResolution else { return }
+        guard currentTrack != nil else {
+            // Nothing playing: the builder discards the old record right away.
+            _ = makePlaybackSnapshot()
+            return
+        }
+        playbackSnapshotPending = true
+        // Counts as the save for the 5 s progress gate, as the eager build used to:
+        // otherwise every 4 Hz tick in the next second would see a stale fingerprint,
+        // ask again, and keep pushing the debounce back.
+        lastPlaybackSaveTime = ProcessInfo.processInfo.systemUptime
+        schedulePlaybackSave(snapshot: nil, progress: nil)
     }
 
     /// Restoring is asynchronous, so there is a window where the player has no current
@@ -663,8 +744,15 @@ final class PlayerViewModel {
     }
 
     private func writePendingPlaybackState() async {
-        let snapshot = pendingSnapshot
-        let progress = pendingProgress
+        // Built first: with no current track the builder discards everything that
+        // was pending, and nothing below may then write a stale record back.
+        var built: PlaybackSnapshot?
+        if playbackSnapshotPending {
+            playbackSnapshotPending = false
+            built = makePlaybackSnapshot()
+        }
+        let snapshot = built ?? pendingSnapshot
+        let progress = built != nil ? currentPlaybackProgress() : pendingProgress
         pendingSnapshot = nil
         pendingProgress = nil
         playbackSaveTask = nil
@@ -680,6 +768,7 @@ final class PlayerViewModel {
         playbackSaveTask = nil
         pendingSnapshot = nil
         pendingProgress = nil
+        playbackSnapshotPending = false
     }
 
     /// The background transition is the last moment this process is guaranteed to run:
@@ -705,6 +794,8 @@ final class PlayerViewModel {
 
     private func savePlaybackProgress() {
         guard isPlaying, ProcessInfo.processInfo.systemUptime - lastPlaybackSaveTime >= 5 else { return }
+        // A full snapshot is already on its way and will carry the position.
+        guard !playbackSnapshotPending else { return }
         // Only re-encode the whole queue when it actually changed; otherwise just save the position.
         guard let currentTrack else { return }
         let fingerprint = queueFingerprint(queue: queue, index: queueIndex ?? queue.count, track: currentTrack)
@@ -714,6 +805,35 @@ final class PlayerViewModel {
         } else {
             savePlaybackState()
         }
+    }
+
+    /// The NetEase song that would play after the current one, or nil when nothing
+    /// follows it (单曲循环, an empty queue, a song the queue cannot place).
+    private func upcomingPreloadTrackID() -> String? {
+        guard playbackMode != .repeatOne, let track = currentTrack, track.source == .netease,
+              !queue.isEmpty else { return nil }
+        let index = queueIndex.flatMap {
+            queue.indices.contains($0) && queue[$0].id == track.id ? $0 : nil
+        } ?? queue.firstIndex(where: { $0.id == track.id && $0.source == track.source })
+        guard let index,
+              let nextIndex = Self.nextQueueIndex(current: index, count: queue.count, direction: 1) else {
+            return nil
+        }
+        let next = queue[nextIndex]
+        guard next.source == .netease, next.id != track.id else { return nil }
+        return next.id
+    }
+
+    /// The queue player moves onto a preloaded song by itself, so it must never hold
+    /// one the queue no longer leads to. Called whenever the queue or the mode changes;
+    /// a stale preload is withdrawn and the next progress tick fetches the right one.
+    private func revalidateUpcomingPreload() {
+        guard let preloaded = streamingPlayer.preloadedTrackID,
+              preloaded != upcomingPreloadTrackID() else { return }
+        streamingPlayer.cancelPreload()
+        playbackPrefetchTask?.cancel()
+        prefetchedUpcomingTrackID = nil
+        prefetchedLyricsForTrackID = nil
     }
 
     /// Fetches the next song's address (and both neighbours' covers) once the current
@@ -756,15 +876,15 @@ final class PlayerViewModel {
                 await netease.prefetchPlaybackTrack(next)
                 guard let self, !Task.isCancelled else { return }
                 // The address alone was never the wait: AVPlayer still had to open a
-                // cold connection to whatever CDN host that song lives on, which in
-                // 歌曲 means a different host almost every time (the list is ordered by
-                // title, not by album). Asking the asset for its header here leaves
-                // the host resolved and connected before the switch.
+                // cold connection to whatever CDN host that song lives on, and then
+                // buffer. 3.1.15: the next song is attached behind this one instead, so
+                // the queue player buffers it now and moves onto it with no gap at the
+                // natural end (and a skip to it starts at once).
                 guard let address = await netease.prefetchedPlaybackURL(forTrackID: next.id) else { return }
-                let key = address.absoluteString
-                if self.warmedMediaAddresses.count > 32 { self.warmedMediaAddresses.removeAll() }
-                guard self.warmedMediaAddresses.insert(key).inserted else { return }
-                await StreamingPlayer.warm(url: address)
+                guard !Task.isCancelled, self.currentTrack?.id == track.id,
+                      self.currentTrack?.source == .netease,
+                      self.upcomingPreloadTrackID() == next.id else { return }
+                self.streamingPlayer.preload(url: address, trackID: next.id)
             }
         }
         let covers = [next, previous].compactMap { $0?.artworkURL }
@@ -939,7 +1059,11 @@ final class PlayerViewModel {
         likedPrewarmTask?.cancel()
     }
 
-    var currentScreen: AppScreen { navigation.last?.screen ?? .home }
+    var currentScreen: AppScreen {
+        // Stack half only: a wheel step does not change which screen is showing.
+        _ = navigationStackVersion
+        return navigationStorage.last?.screen ?? .home
+    }
     var selectedIndex: Int {
         let raw = navigation.last?.selectedIndex ?? 0
         // Clamp to the current screen's valid range so a row always highlights,
@@ -1034,22 +1158,25 @@ final class PlayerViewModel {
     private var browsePlaylists: [MusicPlaylist] {
         let systemID = selectedSource == .spotify ? spotify.likedAnchorPlaylistID : nil
         var seen = Set<String>()
+        var keyer = AlphabetKeyer()
         return sourcePlaylists
             .filter { $0.source == selectedSource && $0.id != systemID && seen.insert($0.id).inserted }
+            .map { playlist in (playlist, keyer.key(playlist.title)) }
             .sorted {
                 // 我喜欢的音乐 is the one playlist the account did not create and
                 // cannot lose, so it stays above the alphabetical rest.
-                if $0.isLiked != $1.isLiked { return $0.isLiked }
-                let order = Self.compareAlphabetically($0.title, $1.title)
-                return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
+                if $0.0.isLiked != $1.0.isLiked { return $0.0.isLiked }
+                let order = Self.compareKeys($0.1, $1.1)
+                return order == .orderedSame ? $0.0.id < $1.0.id : order == .orderedAscending
             }
+            .map(\.0)
     }
 
     /// Alphabetical order for every list in the app: letters first, then
     /// numbers, then punctuation and symbols. Plain `localizedStandardCompare`
     /// ranks "#", "《" and digits above "A", so a single symbol-leading title
     /// pushes the whole alphabet a page down the list.
-    private nonisolated static func compareAlphabetically(_ lhs: String, _ rhs: String) -> ComparisonResult {
+    private nonisolated static func compareKeys(_ lhs: String, _ rhs: String) -> ComparisonResult {
         let lhsBucket = alphabetBucket(lhs)
         let rhsBucket = alphabetBucket(rhs)
         if lhsBucket != rhsBucket { return lhsBucket < rhsBucket ? .orderedAscending : .orderedDescending }
@@ -1063,6 +1190,39 @@ final class PlayerViewModel {
         if first.isLetter { return 0 }
         if first.isNumber { return 1 }
         return 2
+    }
+
+    /// Turns a name into the key a list is sorted by.
+    ///
+    /// A name written in another script gets the romanised initial in front of
+    /// it, so 周杰伦 files under Z next to the Latin titles instead of sitting in
+    /// a block of Han at the end, and the letter the fast-scroll bubble shows is
+    /// where the row actually is. Sorting by hand-written ICU order put the
+    /// Chinese names wherever the collation felt like it.
+    ///
+    /// Romanising a whole title costs ~0.9 s across 20 000 songs, so only the
+    /// first character is romanised, and only once per distinct character — a
+    /// library reuses a few hundred of them.
+    private nonisolated struct AlphabetKeyer {
+        private var initials: [Character: String] = [:]
+
+        mutating func key(_ name: String) -> String {
+            guard let first = name.first(where: { !$0.isWhitespace }), !first.isASCII else {
+                return name
+            }
+            return initial(first) + "\u{1}" + name
+        }
+
+        private mutating func initial(_ character: Character) -> String {
+            if let cached = initials[character] { return cached }
+            let latin = String(character)
+                .applyingTransform(.toLatin, reverse: false)?
+                .applyingTransform(.stripDiacritics, reverse: false)
+            let head = latin?.first(where: { $0.isASCII && ($0.isLetter || $0.isNumber) })
+            let value = head.map { String($0).uppercased() } ?? ""
+            initials[character] = value
+            return value
+        }
     }
 
     private var songs: [Track] { browsingIndex().songs }
@@ -1116,6 +1276,8 @@ final class PlayerViewModel {
     }
 
     private func browsingIndex() -> BrowsingIndex {
+        // Ties the reading body to the rebuild landing (see `browsingIndexVersion`).
+        _ = browsingIndexVersion
         if let cached = cachedBrowsingIndex,
            cached.generation == libraryGeneration, cached.source == selectedSource {
             return cached
@@ -1173,8 +1335,9 @@ final class PlayerViewModel {
         }
         // Precompute the sort key and its bucket once per track instead of twice
         // per comparison.
+        var keyer = AlphabetKeyer()
         let keyed = local.map { track -> (track: Track, key: String, bucket: Int) in
-            let key = songSortKey(track.title)
+            let key = keyer.key(songSortKey(track.title))
             return (track, key, alphabetBucket(key))
         }
         let songs = keyed.sorted {
@@ -1193,7 +1356,9 @@ final class PlayerViewModel {
             }
         }
         let artists = artistTrackIndices.keys
-            .sorted { compareAlphabetically($0, $1) == .orderedAscending }
+            .map { name in (name, keyer.key(name)) }
+            .sorted { compareKeys($0.1, $1.1) == .orderedAscending }
+            .map(\.0)
         var seenAlbums = Set<String>()
         var albums: [LibraryAlbum] = []
         for track in local {
@@ -1203,11 +1368,14 @@ final class PlayerViewModel {
             guard seenAlbums.insert(key).inserted else { continue }
             albums.append(LibraryAlbum(name: name, artist: track.artist))
         }
-        albums.sort {
-            let nameOrder = compareAlphabetically($0.name, $1.name)
-            if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
-            return compareAlphabetically($0.artist, $1.artist) == .orderedAscending
-        }
+        albums = albums
+            .map { album in (album, keyer.key(album.name), keyer.key(album.artist)) }
+            .sorted {
+                let nameOrder = compareKeys($0.1, $1.1)
+                if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+                return compareKeys($0.2, $1.2) == .orderedAscending
+            }
+            .map(\.0)
         return BrowsingIndex(generation: generation, source: source,
                              local: local, songs: songs, artists: artists, albums: albums,
                              artistTrackIndices: artistTrackIndices)
@@ -1285,7 +1453,7 @@ final class PlayerViewModel {
                                                          : (searchMode ? "search" : "queue"))
             + "|" + String(libraryTracksVersion)
             + "|" + String(radioTracksVersion)
-            + "|" + libraryGeneration.uuidString
+            + "|" + libraryGeneration.uuidString + "|" + String(browsingIndexVersion)
             + "|" + String(queueVersion) + "|" + String(searchResultsVersion)
             + "|" + (currentTrack?.id ?? "")
             + "|" + (currentTrack?.artworkURL?.absoluteString ?? "")
@@ -1506,9 +1674,9 @@ final class PlayerViewModel {
             ]
         case .podcasts:
             // Show names are the user's subscriptions, so they are never translated.
-            let key = "podcasts|" + selectedSource.rawValue + "|" + podcastShows.map {
-                $0.id + "\u{1F}" + $0.title
-            }.joined(separator: "\u{1E}")
+            // The episode count is a locale template, so the language is part of it.
+            let key = "podcasts|" + language.rawValue + "|" + selectedSource.rawValue
+                + "|" + String(podcastShowsVersion)
             return memoizedMenuEntries(key) {
                 podcastShows.map { show in
                     MenuEntry(show.title, id: show.id,
@@ -1518,15 +1686,14 @@ final class PlayerViewModel {
                 }
             }
         case .playlists:
-            let visible = browsePlaylists
             // The row text is the user's own; only the count is a locale template,
-            // so the language is part of the identity.
-            let key = "playlists|" + language.rawValue + "|" + visible.map {
-                $0.id + "\u{1F}" + $0.title + "\u{1F}" + ($0.trackCount.map(String.init) ?? "-")
-                    + "\u{1F}" + ($0.isLiked ? "1" : "0")
-            }.joined(separator: "\u{1E}")
+            // so the language is part of the identity. The Spotify like anchor is
+            // hidden from the list, so its id is too (it is not observable itself).
+            let anchor = selectedSource == .spotify ? (spotify.likedAnchorPlaylistID ?? "") : ""
+            let key = "playlists|" + language.rawValue + "|" + selectedSource.rawValue
+                + "|" + String(sourcePlaylistsVersion) + "|" + anchor
             return memoizedMenuEntries(key) {
-                visible.map { playlist in
+                browsePlaylists.map { playlist in
                     MenuEntry(playlist.title, id: playlist.id,
                               detail: playlist.trackCount.map { L10n.text("\($0) 首") },
                               translates: false, action: .open(.playlistTracks(playlist)))
@@ -1534,7 +1701,7 @@ final class PlayerViewModel {
             }
         case .artists:
             let key = "artists|" + language.rawValue + "|" + selectedSource.rawValue
-                + "|" + libraryGeneration.uuidString
+                + "|" + libraryGeneration.uuidString + "|" + String(browsingIndexVersion)
             return memoizedMenuEntries(key) {
                 artistNames.map {
                     MenuEntry($0, translates: false, action: .open(.artistTracks(id: nil, name: $0)))
@@ -1542,7 +1709,7 @@ final class PlayerViewModel {
             }
         case .albums:
             let key = "albums|" + language.rawValue + "|" + selectedSource.rawValue
-                + "|" + libraryGeneration.uuidString
+                + "|" + libraryGeneration.uuidString + "|" + String(browsingIndexVersion)
             return memoizedMenuEntries(key) {
                 libraryAlbums.map { album in
                     MenuEntry(album.name, id: album.artist + "\u{1F}" + album.name,
@@ -2018,6 +2185,8 @@ final class PlayerViewModel {
         guard mode != playbackMode else { return }
         playbackMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: Self.playbackModeKey)
+        // 单曲循环 has no next song, and a reshuffle picks a different one.
+        revalidateUpcomingPreload()
         // The station owns an append-only queue and its own refill thresholds.
         guard !isRadioMode, let currentTrack else { return }
         var tracks = queueBaseTracks.isEmpty ? queue : queueBaseTracks
@@ -3400,7 +3569,10 @@ final class PlayerViewModel {
         requestedTrackID = track.id
         let generation = playbackGeneration
         pendingPlaybackSeek = nil
-        streamingPlayer.stop()
+        // 3.1.15: the buffered next song (gapless preload) survives a change to that
+        // very song — a natural end is already playing it, a skip moves onto it now.
+        // Every other change stops the player exactly as before.
+        streamingPlayer.prepareForTrackChange(toTrackID: track.source == .netease ? track.id : nil)
         if currentTrack?.source == .spotify && track.source != .spotify { spotify.pause() }
         // Publish the requested metadata immediately, then resolve audio in the
         // existing cancellable task. Same-ID resolution/callbacks cannot replay a slide.
@@ -3442,7 +3614,7 @@ final class PlayerViewModel {
                     }
                     self.currentTrack = resolved
                     self.syncNowPlayingInfo()
-                    try self.streamingPlayer.play(url: url)
+                    try self.streamingPlayer.play(url: url, trackID: track.id)
                 } else {
                     self.currentTrack = track
                     try await self.spotify.play(track)
@@ -3719,7 +3891,9 @@ final class PlayerViewModel {
         syncNowPlayingInfo()
     }
     func handleApplicationWillTerminate() {
-        savePlaybackState()
+        // 3.1.15: the debounced save sleeps for a second, which a terminating
+        // process never gets; write synchronously like the background transition.
+        flushPlaybackState()
         spotify.disconnect()
     }
 
@@ -3927,6 +4101,7 @@ final class PlayerViewModel {
                 // `elapsedSeconds` / `durationSeconds` / `isPlaying` each sync the
                 // system card from their didSet, so progress needs no extra call.
                 self.prefetchUpcomingIfNeeded(elapsed: elapsed, duration: duration)
+                self.prefetchUpcomingLyricsIfNeeded(elapsed: elapsed, duration: duration)
             }.store(in: &subscriptions)
         spotify.$isPlaying.combineLatest(spotify.$elapsedSeconds, spotify.$durationSeconds)
             .sink { [weak self] playing, elapsed, duration in
@@ -3939,6 +4114,7 @@ final class PlayerViewModel {
                 self.applyPendingPlaybackSeek(duration: duration)
                 if playingChanged { self.savePlaybackState() }
                 else { self.savePlaybackProgress() }
+                self.prefetchUpcomingLyricsIfNeeded(elapsed: elapsed, duration: duration)
             }.store(in: &subscriptions)
         spotify.$isLoggedIn.sink { [weak self] loggedIn in
             self?.isSpotifyLoggedIn = loggedIn
@@ -3953,6 +4129,17 @@ final class PlayerViewModel {
         streamingPlayer.onInterruptionEnded = { [weak self] in
             guard let self, let track = self.currentTrack, track.source == .netease,
                   self.selectedSource == .netease else { return }
+            // 3.1.15: the same rule as the play key — the paused item is still
+            // attached, so a call or Siri ending resumes it in place. Asking for a new
+            // address here cost a round trip after every interruption, and inside a
+            // -460 window it meant the music did not come back at all. A dead item
+            // still reports through `onError` and is recovered there.
+            if self.streamingPlayer.hasCurrentItem {
+                do {
+                    try self.streamingPlayer.resume()
+                    return
+                } catch {}
+            }
             self.startPlayback(track, at: self.queueIndex, radio: self.isRadioMode,
                                sourceID: self.playbackSourceID, position: self.elapsedSeconds,
                                isResume: true)
@@ -4010,5 +4197,42 @@ final class PlayerViewModel {
                 self.applyPendingPlaybackSeek(duration: self.spotify.durationSeconds)
             }
         }
+    }
+}
+
+// MARK: - 3.2 lyrics
+
+extension PlayerViewModel {
+    /// 3.2.8: lyrics are only shown on the immersive page, so they are only fetched
+    /// while it is switched on (Settings → Appearance, or the play/pause hold, which
+    /// flips the same switch). Off, no song costs a lyric request.
+    static var lyricsWanted: Bool { UserDefaults.standard.bool(forKey: "immersiveNowPlaying") }
+
+    /// Lyrics for the immersive Now Playing. NetEase songs ask NetEase first (with
+    /// its translation); Spotify songs, and NetEase songs it has none for, ask LRCLIB.
+    func loadLyrics(for track: Track?) {
+        lyrics.load(track) { [netease] id in try await netease.lyric(trackID: id) }
+    }
+
+    /// 3.2.8: ten seconds into a song, the next song's lyrics are fetched into the
+    /// cache, so they are on the drum the moment it starts instead of after a
+    /// "loading" pause. Later than the address prefetch (3 s), so the two never ask
+    /// NetEase at the same time; skipped while NetEase is refusing (-460), for
+    /// podcasts, in 单曲循环, and when the immersive page is off.
+    func prefetchUpcomingLyricsIfNeeded(elapsed: Double, duration: Double) {
+        guard isPlaying, Self.lyricsWanted, playbackMode != .repeatOne,
+              let track = currentTrack, !track.isPodcastEpisode,
+              elapsed.isFinite, elapsed > 0 else { return }
+        let trigger = duration.isFinite && duration > 0 ? min(10, duration * 0.5) : 10
+        guard elapsed >= trigger, prefetchedLyricsForTrackID != track.id else { return }
+        guard let index = queueIndex.flatMap({
+            queue.indices.contains($0) && queue[$0].id == track.id ? $0 : nil
+        }) else { return }
+        guard let nextIndex = Self.nextQueueIndex(current: index, count: queue.count, direction: 1) else { return }
+        let next = queue[nextIndex]
+        guard next.id != track.id, !next.isPodcastEpisode else { return }
+        if next.source == .netease, netease.isSpeculationMuted { return }
+        prefetchedLyricsForTrackID = track.id
+        lyrics.prefetch(next) { [netease] id in try await netease.lyric(trackID: id) }
     }
 }

@@ -104,6 +104,17 @@ enum AppScreen: Hashable {
         }
     }
 
+    /// Screens whose rows are sorted by name — the only ones where a letter
+    /// bubble means anything. Everything else runs in playback order (album
+    /// track numbers, a playlist's own order, Personal FM), in the order the
+    /// account handed it over (podcast subscriptions) or by search relevance.
+    var isAlphabeticalList: Bool {
+        switch self {
+        case .songs, .artists, .albums, .playlists: return true
+        default: return false
+        }
+    }
+
     var isTrackList: Bool {
         switch self {
         case .dailyRecommendations, .radio, .songs, .podcastEpisodes,
@@ -308,6 +319,13 @@ enum L10n {
         "歌曲": ("Songs", "歌曲"),
         "跟随系统": ("Follow System", "跟隨系統"),
         "沉浸式播放页": ("Immersive Now Playing", "沉浸式播放頁"),
+        "歌词": ("Lyrics", "歌詞"),
+        "暂无歌词": ("No lyrics for this song", "暫無歌詞"),
+        "纯音乐，请欣赏": ("Instrumental — enjoy the music", "純音樂，請欣賞"),
+        "正在载入歌词…": ("Loading lyrics…", "正在載入歌詞…"),
+        "轻点查看歌词": ("Tap for lyrics", "輕點查看歌詞"),
+        "轻点返回封面": ("Tap to return to the cover", "輕點返回封面"),
+        "长按进入或退出沉浸式播放页": ("Hold to enter or leave the immersive Now Playing", "長按進入或退出沉浸式播放頁"),
         "使用自定强调色": ("Use Custom Accent", "使用自訂強調色"),
         "自定强调色": ("Custom Accent", "自訂強調色"),
         "经典白": ("Classic White", "經典白"),

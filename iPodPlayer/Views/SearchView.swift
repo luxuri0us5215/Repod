@@ -78,6 +78,9 @@ struct SearchView: View {
                 viewModel.playSearchResult(at: index)
             }
             .id(viewModel.searchListID)
+            // The follow engine preloads beyond both edges; keep those rows out
+            // of the fixed search input above this list.
+            .clipped()
         }
         .onChange(of: viewModel.searchFocusRequest) { _, _ in
             queryFocused = true
@@ -131,6 +134,7 @@ struct TrackListView: View {
     var body: some View {
         TrackRowsView(tracks: viewModel.browseTracks, selectedIndex: viewModel.selectedIndex,
                       stateMessage: viewModel.browseStateMessage,
+                      showsIndex: viewModel.currentScreen.isAlphabeticalList,
                       likedSpotifyTrackIDs: viewModel.likedSpotifyTrackIDs,
                       likedNetEaseTrackIDs: viewModel.likedNetEaseTrackIDs,
                       likeAnimation: viewModel.likeAnimation,
@@ -146,6 +150,8 @@ struct TrackRowsView: View {
     let tracks: [Track]
     let selectedIndex: Int
     let stateMessage: String?
+    /// See `LCDFastScrollIndex.showsIndex`: only 歌曲 is sorted by name.
+    var showsIndex = false
     let likedSpotifyTrackIDs: Set<String>
     let likedNetEaseTrackIDs: Set<String>
     let likeAnimation: LikeAnimationEvent?
@@ -194,18 +200,34 @@ struct TrackRowsView: View {
                 .lcdLensHost()
             }
             .scrollIndicators(.hidden)
+            // 3.2.22: iOS 18+ follows the wheel by itself (see `lcdWheelFollow`).
+            .lcdWheelFollow(followID)
             .lcdEdgeFade(appearance.theme.lcdBackground)
-            .modifier(LCDFastScrollIndex(selectedIndex: selectedIndex, count: tracks.count) { index in
+            .modifier(LCDFastScrollIndex(selectedIndex: selectedIndex, count: tracks.count,
+                                         showsIndex: showsIndex) { index in
                 tracks.indices.contains(index) ? LCDFastScrollIndex.indexLetter(tracks[index].title) : nil
             })
             // Dragging the results puts the keyboard away at once instead of
             // dragging it down with the finger.
             .scrollDismissesKeyboard(.immediately)
-            .onChange(of: selectedIndex) { oldIndex, _ in
+            .onChange(of: selectedIndex) { oldIndex, newIndex in
+                // The engine also owns the return to the search input; an
+                // animated proxy scroll here would compete with new wheel steps.
+                guard !LCDWheelFollow.isActive else { return }
                 scrollToSelection(proxy, leavingInput: oldIndex < 0, animated: true)
             }
-            .onAppear { scrollToSelection(proxy, leavingInput: false) }
+            .onAppear {
+                guard !LCDWheelFollow.isActive else { return }
+                scrollToSelection(proxy, leavingInput: false)
+            }
         }
+    }
+
+    /// The selected row's identity in this list, for `lcdWheelFollow`.
+    private var followID: AnyHashable? {
+        if tracks.indices.contains(selectedIndex) { return AnyHashable(selectedIndex) }
+        if loadMoreFailed, selectedIndex == tracks.count { return AnyHashable(Self.loadMoreRowID) }
+        return nil
     }
 
     private func scrollToSelection(_ proxy: ScrollViewProxy, leavingInput: Bool, animated: Bool = false) {
@@ -272,10 +294,11 @@ struct TrackRowsView: View {
                     Text(verbatim: title)
                         .font(AppFont.title)
                         .minimumScaleFactor(showsChevron ? 1 : 0.7)
+                        .lcdSelectionInk(selected)
                     if let subtitle {
                         Text(verbatim: subtitle)
                             .font(AppFont.detail)
-                            .foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText)
+                            .lcdSelectionInk(selected, secondary: true)
                     }
                 }
                 .lineLimit(1)
@@ -284,15 +307,15 @@ struct TrackRowsView: View {
                 if showsChevron {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 14, weight: .bold))
-                        .foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText)
+                        .lcdSelectionInk(selected, secondary: true)
                 }
             }
             .padding(.horizontal, Metrics.horizontalInset)
             // Same rule as the menus: a second line makes the row 60pt.
             .frame(height: subtitle == nil ? Metrics.singleLineRowHeight : Metrics.doubleLineRowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .foregroundStyle(selected ? appearance.theme.selectionInk : appearance.theme.lcdText)
-            .lcdSelectionBackground(selected)
+            .foregroundStyle(appearance.theme.lcdText)
+            .lcdSelectionBackground(selected, id: index == tracks.count ? AnyHashable(Self.loadMoreRowID) : AnyHashable(index))
             .contentShape(Rectangle())
         }
         .buttonStyle(LCDPressFeedbackStyle())

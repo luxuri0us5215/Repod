@@ -352,6 +352,13 @@ enum NetEaseDirectRoute {
             return ("/api/v3/song/detail", ["ids": idsJSON, "c": cJSON])
         case "/album":
             return ("/api/v1/album/\(try value("id"))", [:])
+        case "/lyric":
+            // 3.2: lv = original, tv = translation, kv / rv = karaoke and romaji
+            // (asked for so NetEase answers in its current shape; only lrc / tlyric are read).
+            return ("/api/song/lyric", [
+                "id": try value("id"),
+                "lv": -1, "tv": -1, "kv": -1, "rv": -1
+            ])
         case "/song/url/v1":
             let ids = idList(parameters["ids"] ?? parameters["id"] ?? "")
             guard !ids.isEmpty, let idsJSON = jsonString(ids) else {

@@ -33,7 +33,7 @@ struct SettingsView: View {
                         } label: {
                             rowLabel(entry, selected: index == selectedIndex)
                         }
-                        .buttonStyle(SettingsLCDRowStyle(selected: index == selectedIndex,
+                        .buttonStyle(SettingsLCDRowStyle(id: index, selected: index == selectedIndex,
                                                          height: rowHeight(for: entry)))
                         .id(index)
                         .accessibilityAddTraits(index == selectedIndex ? [.isSelected] : [])
@@ -53,15 +53,20 @@ struct SettingsView: View {
                 .padding(.bottom, 10)
             }
             .scrollIndicators(.hidden)
+            // 3.2.22: iOS 18+ follows the wheel by itself (see `lcdWheelFollow`).
+            .lcdWheelFollow(entries.indices.contains(selectedIndex) ? AnyHashable(selectedIndex) : nil)
             // The menu and track lists already fade at their edges; these pages
             // were the one list on the LCD that still cut a row off at the line.
             .lcdEdgeFade(appearance.theme.lcdBackground)
             .scrollDismissesKeyboard(.interactively)
             .onChange(of: selectedIndex) { _, index in
+                guard !LCDWheelFollow.isActive else { return }
                 proxy.lcdFollow(index, anchor: .center, animated: true)
             }
             .onAppear {
-                proxy.lcdFollow(selectedIndex, anchor: .center, animated: false)
+                if !LCDWheelFollow.isActive {
+                    proxy.lcdFollow(selectedIndex, anchor: .center, animated: false)
+                }
                 #if DEBUG
                 if ProcessInfo.processInfo.arguments.contains("-repod-show-mode-picker") {
                     showsNetEaseModePicker = true
@@ -132,6 +137,7 @@ struct SettingsView: View {
                 // MenuEntry already holds display text, localized at construction.
                 Text(verbatim: entry.title)
                     .font(AppFont.title)
+                    .lcdSelectionInk(selected)
                 field(for: entry, selected: selected)
             }
             Spacer(minLength: 3)
@@ -140,13 +146,15 @@ struct SettingsView: View {
             } else if let detail = entry.detail {
                 Text(verbatim: detail)
                     .font(AppFont.detail)
-                    .foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText)
+                    .lcdSelectionInk(selected, secondary: true)
             }
             if entry.marked {
                 Image(systemName: "checkmark").font(.system(size: 14, weight: .bold))
+                    .lcdSelectionInk(selected)
             } else if case .setting(.theme(let preset)) = entry.action {
                 if appearance.selectedTheme == preset {
                     Image(systemName: "checkmark").font(.system(size: 14, weight: .bold))
+                    .lcdSelectionInk(selected)
                 }
             } else if entry.action == .setting(.customAccentColor) {
                 Circle().fill(appearance.customAccent).frame(width: 20, height: 20)
@@ -154,7 +162,7 @@ struct SettingsView: View {
             } else if entry.showsChevron {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText)
+                    .lcdSelectionInk(selected, secondary: true)
             }
         }
     }
@@ -165,7 +173,7 @@ struct SettingsView: View {
             switch entry.action {
             case .setting(.neteaseAddress):
                 TextField("http://<云电脑 Tailscale IP>:3000", text: $neteaseBaseURL,
-                          prompt: Text("http://<云电脑 Tailscale IP>:3000").foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText))
+                          prompt: Text("http://<云电脑 Tailscale IP>:3000"))
                     .keyboardType(.URL)
                     .submitLabel(.done)
                     .focused($focusedField, equals: .neteaseAddress)
@@ -173,14 +181,14 @@ struct SettingsView: View {
                     .accessibilityLabel("网易云服务地址")
             case .setting(.spotifyClientID):
                 TextField("客户端标识", text: $spotifyClientID,
-                          prompt: Text("客户端标识").foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText))
+                          prompt: Text("客户端标识"))
                     .keyboardType(.asciiCapable)
                     .focused($focusedField, equals: .spotifyClientID)
                     .simultaneousGesture(TapGesture().onEnded { selectField(.spotifyClientID) })
                     .accessibilityLabel("Spotify 客户端标识")
             case .setting(.spotifyRedirectURI):
                 TextField("回调地址", text: $spotifyRedirectURI,
-                          prompt: Text("回调地址").foregroundStyle(selected ? appearance.theme.selectionSecondaryInk : appearance.theme.lcdSecondaryText))
+                          prompt: Text("回调地址"))
                     .keyboardType(.URL)
                     .focused($focusedField, equals: .spotifyRedirectURI)
                     .simultaneousGesture(TapGesture().onEnded { selectField(.spotifyRedirectURI) })
@@ -190,6 +198,7 @@ struct SettingsView: View {
             }
         }
         .font(AppFont.detail)
+        .lcdSelectionInk(selected, secondary: true)
         .textInputAutocapitalization(.never)
         .autocorrectionDisabled()
         .onSubmit { viewModel.settingsChanged() }
@@ -258,6 +267,7 @@ struct SettingsView: View {
 
 @MainActor
 private struct SettingsLCDRowStyle: ButtonStyle {
+    let id: Int
     let selected: Bool
     let height: CGFloat
     @EnvironmentObject private var appearance: AppearanceSettings
@@ -266,11 +276,11 @@ private struct SettingsLCDRowStyle: ButtonStyle {
         configuration.label
             .font(AppFont.title)
             .lineLimit(1)
-            .foregroundStyle(selected ? appearance.theme.selectionInk : appearance.theme.lcdText)
+            .foregroundStyle(appearance.theme.lcdText)
             .padding(.horizontal, Metrics.horizontalInset)
             .frame(height: height)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .lcdSelectionBackground(selected)
+            .lcdSelectionBackground(selected, id: AnyHashable(id))
             .overlay {
                 // Same pressed state as every other LCD row; the selection bar is
                 // the wheel's signal and does not move for a touch.

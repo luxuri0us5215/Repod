@@ -7,8 +7,17 @@ import UIKit
 final class SpotifyService: NSObject, ObservableObject {
     @Published private(set) var isLoggedIn = false
     @Published private(set) var statusMessage = "请在设置中登录 Spotify"
-    @Published private(set) var isPlaying = false
-    @Published private(set) var elapsedSeconds = 0.0
+    @Published private(set) var isPlaying = false {
+        didSet {
+            reanchorProgress()
+            updateInterpolationTimer()
+        }
+    }
+    /// 3.2.8: every real position (Spotify's state, a seek, a new song) re-anchors
+    /// the local interpolation; the interpolation's own writes do not.
+    @Published private(set) var elapsedSeconds = 0.0 {
+        didSet { if !isInterpolatingProgress { reanchorProgress() } }
+    }
     @Published private(set) var durationSeconds = 0.0
     @Published private(set) var currentURI: String?
     @Published private(set) var isAuthenticating = false
@@ -68,6 +77,15 @@ final class SpotifyService: NSObject, ObservableObject {
     private var connectionTimeout: Task<Void, Never>?
     private var stateTimer: Timer?
     private var interpolationTimer: Timer?
+    /// 3.2.8: the last real position and when it was true. Progress between Spotify's
+    /// state updates is projected from here (position + time since), instead of
+    /// adding 0.25 s per timer tick: a tick that fired late or was skipped while the
+    /// main thread was busy used to lose that time until the next 10 s poll, so the
+    /// lyrics drifted behind the singer and then jumped.
+    private var progressAnchor: (seconds: Double, uptime: TimeInterval)?
+    private var isInterpolatingProgress = false
+    /// True between `startStateUpdates` and `stopStateTimers`.
+    private var stateUpdatesActive = false
     private var lastPlayerState: (uri: String, isPlaying: Bool, position: Double, duration: Double)?
     private var endedEventURI: String?
     private var suppressEndDetection = false
@@ -1369,19 +1387,52 @@ final class SpotifyService: NSObject, ObservableObject {
         stateTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.fetchPlayerState() }
         }
-        interpolationTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self, self.isPlaying, self.remote?.isConnected == true, self.durationSeconds > 0 else { return }
-                self.elapsedSeconds = min(self.elapsedSeconds + 0.25, self.durationSeconds)
-            }
-        }
+        interpolationTimer = nil
+        stateUpdatesActive = true
+        updateInterpolationTimer()
     }
 
     private func stopStateTimers() {
+        stateUpdatesActive = false
         stateTimer?.invalidate()
         stateTimer = nil
         interpolationTimer?.invalidate()
         interpolationTimer = nil
+    }
+
+    private func reanchorProgress() {
+        progressAnchor = (elapsedSeconds, ProcessInfo.processInfo.systemUptime)
+    }
+
+    /// 3.2.8: the 4 Hz interpolation runs only while a song plays; paused, nothing
+    /// moves, so nothing needs to wake up.
+    private func updateInterpolationTimer() {
+        let wanted = stateUpdatesActive && isPlaying
+        if !wanted {
+            interpolationTimer?.invalidate()
+            interpolationTimer = nil
+            return
+        }
+        guard interpolationTimer == nil else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.interpolateProgress() }
+        }
+        timer.tolerance = 0.05
+        interpolationTimer = timer
+    }
+
+    private func interpolateProgress() {
+        guard isPlaying, remote?.isConnected == true, durationSeconds > 0 else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard let anchor = progressAnchor else {
+            reanchorProgress()
+            return
+        }
+        let projected = min(anchor.seconds + max(0, now - anchor.uptime), durationSeconds)
+        guard projected != elapsedSeconds else { return }
+        isInterpolatingProgress = true
+        elapsedSeconds = projected
+        isInterpolatingProgress = false
     }
 
     private func fetchPlayerState() {

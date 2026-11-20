@@ -130,36 +130,59 @@ final class PlaybackStateStore {
         return restored
     }
 
-    /// Encodes and writes both records off the main actor. The debounced caller may
-    /// still have a newer snapshot queued by the time this finishes; whoever awaits
-    /// last writes, which is the same ordering the previous synchronous saves had.
+    /// 3.1.15: every write and delete goes through this one serial queue, in the
+    /// order it was asked for. Before, each debounced save was its own detached task,
+    /// so an older snapshot still being encoded could land *after* the synchronous
+    /// background flush and put a stale queue or position back on disk.
+    private nonisolated static let ioQueue = DispatchQueue(
+        label: ((Bundle.main.bundleIdentifier ?? "repod") + ".playback-state"), qos: .utility
+    )
+
+    /// Encodes and writes both records off the main actor, behind any write that
+    /// was asked for earlier.
     func save(_ snapshot: PlaybackSnapshot, progress: PlaybackProgress?) async {
         let stateURL = self.stateURL
         let progressURL = self.progressURL
-        await Task.detached(priority: .utility) {
-            Self.write(snapshot, to: stateURL)
-            if let progress { Self.write(progress, to: progressURL) }
-        }.value
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            Self.ioQueue.async {
+                Self.write(snapshot, to: stateURL)
+                if let progress { Self.write(progress, to: progressURL) }
+                continuation.resume()
+            }
+        }
     }
 
     func saveProgress(_ progress: PlaybackProgress) async {
         let progressURL = self.progressURL
-        await Task.detached(priority: .utility) {
-            Self.write(progress, to: progressURL)
-        }.value
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            Self.ioQueue.async {
+                Self.write(progress, to: progressURL)
+                continuation.resume()
+            }
+        }
     }
 
     /// The background transition suspends the process right after this returns, so the
-    /// last write cannot be deferred.
+    /// last write cannot be deferred. `sync` waits out a write already running and
+    /// then goes last, so nothing older can overwrite it.
     func flush(_ snapshot: PlaybackSnapshot, progress: PlaybackProgress?) {
-        Self.write(snapshot, to: stateURL)
-        if let progress { Self.write(progress, to: progressURL) }
+        let stateURL = self.stateURL
+        let progressURL = self.progressURL
+        Self.ioQueue.sync {
+            Self.write(snapshot, to: stateURL)
+            if let progress { Self.write(progress, to: progressURL) }
+        }
     }
 
-    /// No playing track means there is nothing to resume.
+    /// No playing track means there is nothing to resume. Queued, so a save that
+    /// was asked for earlier cannot recreate the files after they were removed.
     func removeAll() {
-        try? FileManager.default.removeItem(at: stateURL)
-        try? FileManager.default.removeItem(at: progressURL)
+        let stateURL = self.stateURL
+        let progressURL = self.progressURL
+        Self.ioQueue.async {
+            try? FileManager.default.removeItem(at: stateURL)
+            try? FileManager.default.removeItem(at: progressURL)
+        }
         UserDefaults.standard.removeObject(forKey: Self.legacyStateKey)
         UserDefaults.standard.removeObject(forKey: Self.legacyProgressKey)
     }

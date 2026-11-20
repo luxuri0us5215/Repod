@@ -68,7 +68,7 @@ struct SourceSwitcherView: View {
                     .frame(maxWidth: .infinity)
                     .frame(height: Metrics.doubleLineRowHeight)
                     .offset(y: CGFloat(viewModel.selectedIndex) * Metrics.doubleLineRowHeight)
-                    .animation(reduceMotion ? nil : LCDLensHost.glide, value: viewModel.selectedIndex)
+                    .animation(reduceMotion ? nil : LCDFollowPace.glide, value: viewModel.selectedIndex)
             }
             Spacer(minLength: 0)
             // The hint belongs to the foot of the screen, the way the iPod printed
